@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<motor>
+    <name>T-Motor V2808 KV1950</name>
+    <count>1</count>
+    <Kv   unit="rpm/V">1950</Kv>
+    <R    unit="ohm">0.033</R>
+    <I0   unit="A">2.45</I0>
+    <I0_V unit="V">10</I0_V>
+    <Pmax unit="W">1849</Pmax>
+</motor>

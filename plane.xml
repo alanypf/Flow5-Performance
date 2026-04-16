@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plane>
+    <mass unit="kg">4</mass>
+    <area unit="m^2">0.063</area>
+    <chord unit="m">0.07</chord>
+    <rho unit="kg/m^3">1.225</rho>
+    <gravity unit="m/s^2">9.81</gravity>
+    <arm unit="m">0.15</arm>
+    <dihedral unit="deg">25</dihedral> <!-- X-arm half-angle from longitudinal axis (45 = symmetric X) -->
+    <cg unit="m">0.025</cg>       <!-- CG position from leading edge -->
+    <ac unit="m">0.035</ac>      <!-- AC position from leading edge (≈25% chord) -->
+    <inertia unit="kg*m^2">
+        <Ixx>0.049</Ixx>
+        <Iyy>0.082</Iyy>
+        <Izz>0.058</Izz>
+        <Ixz></Ixz>
+    </inertia>
+</plane>

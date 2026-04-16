@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<motor>
+    <name>T-Motor V3120 KV500</name>
+    <count>4</count>
+    <Kv   unit="rpm/V">500</Kv>
+    <R    unit="ohm">0.0764</R>
+    <I0   unit="A">0.95</I0>
+    <I0_V unit="V">10</I0_V>
+    <Imax unit="A">68</Imax>
+    <Pmax unit="W">3200</Pmax>
+</motor>

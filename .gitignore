@@ -1,0 +1,14 @@
+# Generated plots
+plots/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

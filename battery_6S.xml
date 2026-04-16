@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<battery>
+    <name>Tattu 6S 1800mAh 85C</name>
+    <chemistry>LiPo</chemistry>
+
+    <!-- Pack configuration: S cells in series, P strings in parallel -->
+    <configuration>
+        <series>6</series>
+        <parallel>1</parallel>
+    </configuration>
+
+    <!-- Per-cell properties -->
+    <cell>
+        <V_nominal unit="V">3.7</V_nominal>
+        <V_full    unit="V">4.2</V_full>
+        <V_empty   unit="V">3.3</V_empty>
+        <capacity  unit="Ah">1.8</capacity>
+        <R_internal unit="ohm">0.005</R_internal>
+    </cell>
+
+    <!-- Optional pack-level limits -->
+    <C_rating unit="1/h">150</C_rating>
+</battery>
