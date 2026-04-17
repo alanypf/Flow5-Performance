@@ -64,7 +64,12 @@
       "Bash(py -3 performance.py PER3_8x8E.txt motor.xml battery.xml polars.txt)",
       "Bash(py -3 performance.py PER3_8x10E.txt motor.xml battery.xml polars.txt)",
       "Bash(py -3 performance.py PER3_525x8E.txt motor.xml battery.xml polars.txt)",
-      "Bash(python performance.py PER3_7x15E.txt motor.xml battery.xml polars.txt --plane plane.xml --no-plot)"
+      "Bash(python performance.py PER3_7x15E.txt motor.xml battery.xml polars.txt --plane plane.xml --no-plot)",
+      "Bash(python -c \"import motor_prop_performance; import performance; print\\('Both modules import OK'\\)\")",
+      "Bash(py -3 -c \"import motor_prop_performance; import performance; print\\('Both modules import OK'\\)\")",
+      "Bash(py -3 -c \"from performance import isa_density, altitude_speed_sweep, plot_altitude_speeds, AltitudeSpeedPoint; print\\(f'ISA density at sea level: {isa_density\\(0\\):.4f}'\\); print\\(f'ISA density at 3000m: {isa_density\\(3000\\):.4f}'\\); print\\('All imports OK'\\)\")",
+      "Bash(py -3 -c \"import ast; ast.parse\\(open\\('performance.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(py -3 -c \"import ast; ast.parse\\(open\\('performance.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
     ]
   }
 }

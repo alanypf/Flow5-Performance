@@ -450,6 +450,20 @@ def sweep_throttle(motor: Motor, prop: Propeller, battery: Battery,
 # ---------------------------------------------------------------------------
 
 
+def _save_individual_mp(fig, path):
+    """Save a single-plot figure and close it."""
+    import matplotlib.pyplot as plt
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _individual_dir_mp(save_path: str) -> str:
+    """Return a sibling 'individual/' directory next to *save_path*."""
+    base = os.path.splitext(save_path)[0]
+    return base + "__individual"
+
+
 def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
                  battery: Battery, throttle: float, soc: float,
                  save_path: str | None = None, show: bool = True) -> None:
@@ -489,6 +503,12 @@ def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
     lbl_1 = " (per motor)" if n > 1 else ""
     lbl_t = " (total)" if n > 1 else ""
 
+    # --- Individual plots directory ---
+    ind = _individual_dir_mp(save_path) if save_path else None
+    if ind:
+        os.makedirs(ind, exist_ok=True)
+    n_ind = 0
+
     ax = axes[0, 0]
     if n > 1:
         ax.plot(v, thrust_1, "x--", color="tab:cyan", alpha=0.6,
@@ -500,6 +520,18 @@ def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
     ax.set_title("Thrust vs airspeed")
     if n > 1:
         ax.legend(fontsize=8)
+
+    # Individual: thrust
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        if n > 1:
+            ai.plot(v, thrust_1, "x--", color="tab:cyan", alpha=0.6, label="per motor")
+        ai.plot(v, thrust_tot, "o-", color="tab:blue",
+                label=f"total ({n} motors)" if n > 1 else None)
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Thrust [N]")
+        ai.set_title("Thrust vs airspeed"); ai.grid(True, alpha=0.3)
+        if n > 1: ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "01_thrust.png")); n_ind += 1
 
     ax = axes[0, 1]
     ax.plot(v, P_elec_tot, "o-", color="tab:red",
@@ -518,6 +550,21 @@ def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
     ax.grid(True, alpha=0.3)
     ax.set_title("Power flow")
 
+    # Individual: power flow
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(v, P_elec_tot, "o-", color="tab:red", label=f"P_elec{lbl_t}")
+        ai.plot(v, P_shaft_tot, "s-", color="tab:orange", label=f"P_shaft{lbl_t}")
+        ai.plot(v, thrust_tot * v, "^-", color="tab:green", label="P_useful = T·V")
+        if motor.Pmax is not None:
+            ai.axhline(motor.Pmax, color="grey", ls=":", lw=1,
+                       label=f"motor Pmax={motor.Pmax:g} W")
+            ai.axhline(motor.Pmax * n, color="k", ls="--", lw=1,
+                       label=f"total Pmax={motor.Pmax * n:g} W")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Power [W]")
+        ai.set_title("Power flow"); ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "02_power_flow.png")); n_ind += 1
+
     ax = axes[0, 2]
     ax.plot(v, eta_m, "o-", label="η motor")
     ax.plot(v, eta_p, "s-", label="η prop")
@@ -528,12 +575,31 @@ def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
     ax.grid(True, alpha=0.3)
     ax.set_title("Efficiencies")
 
+    # Individual: efficiencies
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(v, eta_m, "o-", label="η motor")
+        ai.plot(v, eta_p, "s-", label="η prop")
+        ai.plot(v, eta_t, "^-", label="η total")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Efficiency")
+        ai.set_ylim(0, 1); ai.set_title("Efficiencies")
+        ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "03_efficiencies.png")); n_ind += 1
+
     ax = axes[1, 0]
     ax.plot(v, rpm, "o-", color="tab:purple")
     ax.set_ylabel("RPM")
     ax.set_xlabel("Airspeed [m/s]")
     ax.grid(True, alpha=0.3)
     ax.set_title("Operating RPM")
+
+    # Individual: RPM
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(v, rpm, "o-", color="tab:purple")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("RPM")
+        ai.set_title("Operating RPM"); ai.grid(True, alpha=0.3)
+        _save_individual_mp(fi, os.path.join(ind, "04_operating_rpm.png")); n_ind += 1
 
     ax = axes[1, 1]
     if n > 1:
@@ -553,6 +619,23 @@ def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
     if n > 1 or motor.Imax is not None:
         ax.legend(fontsize=8)
 
+    # Individual: current draw
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        if n > 1:
+            ai.plot(v, I_1, "x--", color="lightsalmon", alpha=0.6, label="per motor")
+        ai.plot(v, I_tot, "o-", color="tab:red",
+                label=f"total ({n} motors)" if n > 1 else None)
+        if motor.Imax is not None:
+            ai.axhline(motor.Imax, color="grey", ls=":", lw=1,
+                       label=f"motor Imax={motor.Imax:g} A")
+            ai.axhline(motor.Imax * n, color="k", ls="--", lw=1,
+                       label=f"total Imax={motor.Imax * n:g} A")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Battery current [A]")
+        ai.set_title("Current draw"); ai.grid(True, alpha=0.3)
+        if n > 1 or motor.Imax is not None: ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "05_current_draw.png")); n_ind += 1
+
     ax = axes[1, 2]
     # Thrust-to-power (g/W) — common figure of merit
     g_per_W = np.where(P_elec_tot > 0,
@@ -563,10 +646,20 @@ def plot_results(ops: list[OperatingPoint], prop: Propeller, motor: Motor,
     ax.grid(True, alpha=0.3)
     ax.set_title("Propulsive economy")
 
+    # Individual: propulsive economy
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(v, g_per_W, "o-", color="tab:brown")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Thrust / Power [g/W]")
+        ai.set_title("Propulsive economy"); ai.grid(True, alpha=0.3)
+        _save_individual_mp(fi, os.path.join(ind, "06_propulsive_economy.png")); n_ind += 1
+
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"Saved plot to {save_path}")
+        if n_ind:
+            print(f"Saved {n_ind} individual plots to {ind}/")
     if show:
         plt.show()
     else:
@@ -601,6 +694,12 @@ def plot_throttle_sweep(throttles: np.ndarray, ops: list[OperatingPoint],
              f"(V={v_ms:.1f} m/s, SoC={soc:.2f})")
     fig.suptitle(title, fontsize=12)
 
+    # --- Individual plots directory ---
+    ind = _individual_dir_mp(save_path) if save_path else None
+    if ind:
+        os.makedirs(ind, exist_ok=True)
+    n_ind = 0
+
     # --- Thrust ---
     ax = axes[0]
     if n > 1:
@@ -616,6 +715,17 @@ def plot_throttle_sweep(throttles: np.ndarray, ops: list[OperatingPoint],
     if n > 1:
         ax.legend(fontsize=8)
 
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        if n > 1:
+            ai.plot(throttles, thrust_1, "x--", color="tab:cyan", alpha=0.6, label="per motor")
+        ai.plot(throttles, thrust_tot, "o-", color="tab:blue",
+                label=f"total ({n} motors)" if n > 1 else None)
+        ai.set_xlabel("Throttle"); ai.set_ylabel("Thrust [N]")
+        ai.set_xlim(0, 1); ai.set_title("Thrust vs throttle"); ai.grid(True, alpha=0.3)
+        if n > 1: ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "01_thrust.png")); n_ind += 1
+
     # --- Torque ---
     ax = axes[1]
     if n > 1:
@@ -630,6 +740,17 @@ def plot_throttle_sweep(throttles: np.ndarray, ops: list[OperatingPoint],
     ax.set_title("Torque vs throttle")
     if n > 1:
         ax.legend(fontsize=8)
+
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        if n > 1:
+            ai.plot(throttles, torque_1, "x--", color="moccasin", alpha=0.6, label="per motor")
+        ai.plot(throttles, torque_tot, "o-", color="tab:orange",
+                label=f"total ({n} motors)" if n > 1 else None)
+        ai.set_xlabel("Throttle"); ai.set_ylabel("Torque [N·m]")
+        ai.set_xlim(0, 1); ai.set_title("Torque vs throttle"); ai.grid(True, alpha=0.3)
+        if n > 1: ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "02_torque.png")); n_ind += 1
 
     # --- Shaft power ---
     ax = axes[2]
@@ -651,6 +772,22 @@ def plot_throttle_sweep(throttles: np.ndarray, ops: list[OperatingPoint],
     if n > 1 or motor.Pmax is not None:
         ax.legend(fontsize=8)
 
+    if ind:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        if n > 1:
+            ai.plot(throttles, P_shaft_1, "x--", color="lightsalmon", alpha=0.6, label="per motor")
+        ai.plot(throttles, P_shaft_tot, "o-", color="tab:red",
+                label=f"total ({n} motors)" if n > 1 else None)
+        if motor.Pmax is not None:
+            ai.axhline(motor.Pmax, color="grey", ls=":", lw=1,
+                       label=f"motor Pmax={motor.Pmax:g} W")
+            ai.axhline(motor.Pmax * n, color="k", ls="--", lw=1,
+                       label=f"total Pmax={motor.Pmax * n:g} W")
+        ai.set_xlabel("Throttle"); ai.set_ylabel("Shaft power [W]")
+        ai.set_xlim(0, 1); ai.set_title("Power vs throttle"); ai.grid(True, alpha=0.3)
+        if n > 1 or motor.Pmax is not None: ai.legend(fontsize=9)
+        _save_individual_mp(fi, os.path.join(ind, "03_shaft_power.png")); n_ind += 1
+
     if n > 1:
         # --- Total electrical power ---
         ax = axes[3]
@@ -670,6 +807,20 @@ def plot_throttle_sweep(throttles: np.ndarray, ops: list[OperatingPoint],
         ax.set_title("Elec power vs throttle")
         ax.legend(fontsize=8)
 
+        if ind:
+            fi, ai = plt.subplots(figsize=(7, 5))
+            ai.plot(throttles, P_elec_1, "x--", color="lightsalmon", alpha=0.6, label="per motor")
+            ai.plot(throttles, P_elec_tot, "o-", color="tab:red", label=f"total ({n} motors)")
+            if motor.Pmax is not None:
+                ai.axhline(motor.Pmax, color="grey", ls=":", lw=1,
+                           label=f"motor Pmax={motor.Pmax:g} W")
+                ai.axhline(motor.Pmax * n, color="k", ls="--", lw=1,
+                           label=f"total Pmax={motor.Pmax * n:g} W")
+            ai.set_xlabel("Throttle"); ai.set_ylabel("Elec power [W]")
+            ai.set_xlim(0, 1); ai.set_title("Elec power vs throttle")
+            ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+            _save_individual_mp(fi, os.path.join(ind, "04_elec_power.png")); n_ind += 1
+
         # --- Total current ---
         ax = axes[4]
         ax.plot(throttles, I_1, "x--", color="lightsalmon", alpha=0.6,
@@ -688,10 +839,26 @@ def plot_throttle_sweep(throttles: np.ndarray, ops: list[OperatingPoint],
         ax.set_title("Current vs throttle")
         ax.legend(fontsize=8)
 
+        if ind:
+            fi, ai = plt.subplots(figsize=(7, 5))
+            ai.plot(throttles, I_1, "x--", color="lightsalmon", alpha=0.6, label="per motor")
+            ai.plot(throttles, I_tot, "o-", color="tab:red", label=f"total ({n} motors)")
+            if motor.Imax is not None:
+                ai.axhline(motor.Imax, color="grey", ls=":", lw=1,
+                           label=f"motor Imax={motor.Imax:g} A")
+                ai.axhline(motor.Imax * n, color="k", ls="--", lw=1,
+                           label=f"total Imax={motor.Imax * n:g} A")
+            ai.set_xlabel("Throttle"); ai.set_ylabel("Current [A]")
+            ai.set_xlim(0, 1); ai.set_title("Current vs throttle")
+            ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+            _save_individual_mp(fi, os.path.join(ind, "05_current.png")); n_ind += 1
+
     fig.tight_layout(rect=[0, 0, 1, 0.93])
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"Saved plot to {save_path}")
+        if n_ind:
+            print(f"Saved {n_ind} individual plots to {ind}/")
     if show:
         plt.show()
     else:

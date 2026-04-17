@@ -93,6 +93,74 @@ def stall_speed(polar: dict, mass: float, area: float,
     return float(np.sqrt(2.0 * mass * g / (rho * area * cl_max)))
 
 
+# ---------------------------------------------------------------------------
+# ISA atmosphere & altitude-dependent characteristic speeds
+# ---------------------------------------------------------------------------
+
+
+def isa_density(altitude_m: float) -> float:
+    """ISA air density [kg/m³] for altitude below 11 000 m (troposphere)."""
+    T0 = 288.15        # sea-level temperature [K]
+    L = 0.0065         # lapse rate [K/m]
+    rho0 = 1.225       # sea-level density [kg/m³]
+    g0 = 9.80665
+    R = 287.0528       # specific gas constant for air [J/(kg·K)]
+    T = T0 - L * altitude_m
+    return rho0 * (T / T0) ** (g0 / (L * R) - 1.0)
+
+
+@dataclass
+class AltitudeSpeedPoint:
+    altitude_m: float
+    rho: float
+    V_stall: float
+    V_best_range: float
+    V_best_endurance: float
+
+
+def altitude_speed_sweep(polar: dict, mass: float, area: float,
+                         g: float = 9.81,
+                         alt_min: float = 0.0,
+                         alt_max: float = 3000.0,
+                         alt_step: float = 100.0,
+                         ) -> list[AltitudeSpeedPoint]:
+    """Compute stall, best-range, and best-endurance speeds vs altitude."""
+    cl_pre, cd_pre = _polar_prestall(polar)
+    cl_max = float(cl_pre[-1])
+
+    cl = np.asarray(polar["cl"], dtype=float)
+    cd = np.asarray(polar["cd"], dtype=float)
+    W = mass * g
+
+    # Best range: max L/D → CL at max CL/CD
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ld = np.where(cd > 0, cl / cd, np.nan)
+    i_ld = int(np.nanargmax(ld))
+    cl_range = cl[i_ld]
+
+    # Best endurance: max CL^1.5 / CD
+    with np.errstate(divide="ignore", invalid="ignore"):
+        endur_metric = np.where((cd > 0) & (cl > 0), cl ** 1.5 / cd, np.nan)
+    i_e = int(np.nanargmax(endur_metric))
+    cl_endur = cl[i_e]
+
+    out: list[AltitudeSpeedPoint] = []
+    alt = alt_min
+    while alt <= alt_max + 1e-9:
+        rho = isa_density(alt)
+        v_stall = float(np.sqrt(2 * W / (rho * area * cl_max)))
+        v_range = float(np.sqrt(2 * W / (rho * area * cl_range))) if cl_range > 0 else float("nan")
+        v_endur = float(np.sqrt(2 * W / (rho * area * cl_endur))) if cl_endur > 0 else float("nan")
+        out.append(AltitudeSpeedPoint(
+            altitude_m=alt, rho=rho,
+            V_stall=v_stall,
+            V_best_range=v_range,
+            V_best_endurance=v_endur,
+        ))
+        alt += alt_step
+    return out
+
+
 def alpha_level_flight(polar: dict, mass: float, area: float, rho: float,
                        g: float, V: np.ndarray) -> np.ndarray:
     """Angle of attack [deg] for steady level flight at each V (m/s).
@@ -739,6 +807,69 @@ def print_report(plane: dict, polar: dict, motor: Motor, prop: Propeller,
 # ---------------------------------------------------------------------------
 
 
+def plot_altitude_speeds(polar: dict, mass: float, area: float,
+                         g: float = 9.81,
+                         save_path: str | None = None,
+                         show: bool = False) -> None:
+    """Plot stall, best-range, and best-endurance speeds vs altitude (0–3000 m)."""
+    import matplotlib.pyplot as plt
+
+    pts = altitude_speed_sweep(polar, mass, area, g,
+                               alt_min=0.0, alt_max=3000.0, alt_step=50.0)
+    alt = np.array([p.altitude_m for p in pts])
+    v_stall = np.array([p.V_stall for p in pts])
+    v_range = np.array([p.V_best_range for p in pts])
+    v_endur = np.array([p.V_best_endurance for p in pts])
+    rho_arr = np.array([p.rho for p in pts])
+
+    fig, ax1 = plt.subplots(figsize=(7, 5))
+
+    ax1.plot(alt, v_stall, "o-", color="tab:red", markersize=3,
+             label=f"$V_{{stall}}$  ({v_stall[0]:.1f} – {v_stall[-1]:.1f} m/s)")
+    ax1.plot(alt, v_endur, "s-", color="tab:green", markersize=3,
+             label=f"$V_{{best\\ endurance}}$  ({v_endur[0]:.1f} – {v_endur[-1]:.1f} m/s)")
+    ax1.plot(alt, v_range, "^-", color="tab:blue", markersize=3,
+             label=f"$V_{{best\\ range}}$  ({v_range[0]:.1f} – {v_range[-1]:.1f} m/s)")
+
+    ax1.fill_between(alt, v_stall, v_endur, alpha=0.08, color="tab:orange")
+
+    ax1.set_xlabel("Altitude [m]")
+    ax1.set_ylabel("Airspeed [m/s]")
+    ax1.set_title(f"Characteristic speeds vs altitude  (m={mass:.2f} kg, S={area:.4f} m²)")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="upper left", fontsize=9)
+
+    # Secondary axis: air density
+    ax2 = ax1.twinx()
+    ax2.plot(alt, rho_arr, "--", color="grey", alpha=0.5, linewidth=1)
+    ax2.set_ylabel("Air density [kg/m³]", color="grey")
+    ax2.tick_params(axis="y", labelcolor="grey")
+
+    fig.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved altitude-speed plot to {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def _save_individual(fig, path):
+    """Save a single-plot figure and close it."""
+    import matplotlib.pyplot as plt
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _individual_dir(save_path: str) -> str:
+    """Return a sibling 'individual/' directory next to *save_path*."""
+    base = os.path.splitext(save_path)[0]
+    return base + "__individual"
+
+
 def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
                      battery: Battery, n_motors: int,
                      hover: HoverPoint | None,
@@ -779,6 +910,13 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
 
     valid_ctrl = [c for c in ctrl if c is not None] if ctrl else []
     n_rows = 3 if valid_ctrl else 2
+
+    # --- Individual plots directory ---
+    ind = _individual_dir(save_path)
+    os.makedirs(ind, exist_ok=True)
+    n_ind = 0
+
+    # ---- Combined figure ----
     fig, axes = plt.subplots(n_rows, 4, figsize=(18, 4.25 * n_rows))
     hover_str = ("hover: INFEASIBLE" if hover is None else
                  f"hover: {hover.throttle*100:.0f}% thr, "
@@ -814,6 +952,25 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
 
+    # Individual: T/W
+    fi, ai = plt.subplots(figsize=(7, 5))
+    if V_k.size:
+        if hover is not None:
+            ai.plot(V_tw, TWm, "o-", color="tab:red",
+                    label=f"T/W max (full throttle x {n_motors})")
+            ai.plot(V_tw, TWt, "s-", color="tab:blue", label="T/W trim (= D/W)")
+        else:
+            ai.plot(V_k, TW_max, "o-", color="tab:red",
+                    label=f"T/W max (full throttle x {n_motors})")
+            ai.plot(V_k, TW_trim, "s-", color="tab:blue", label="T/W trim (= D/W)")
+    else:
+        ai.plot(V_c, drag / W, "s-", color="tab:blue", label="T/W trim")
+    ai.axhline(1.0, color="k", ls=":", lw=1, label="T/W = 1 (hover)")
+    ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Thrust / Weight")
+    ai.set_title(f"Thrust-to-weight vs airspeed  (W = {W:.1f} N)")
+    ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+    _save_individual(fi, os.path.join(ind, "01_thrust_to_weight.png")); n_ind += 1
+
     # 2) Electrical power required for cruise trim
     ax = axes[0, 1]
     ax.plot(V_c, P, "o-", color="tab:purple")
@@ -824,6 +981,15 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
     ax.set_title("Cruise trim power")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
+
+    # Individual: cruise power
+    fi, ai = plt.subplots(figsize=(7, 5))
+    ai.plot(V_c, P, "o-", color="tab:purple")
+    ai.plot(V_c[i_end], P[i_end], "*", ms=14, color="tab:orange",
+            label=f"min P @ {V_c[i_end]:.1f} m/s = {P[i_end]:.0f} W")
+    ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("P_elec total [W]")
+    ai.set_title("Cruise trim power"); ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+    _save_individual(fi, os.path.join(ind, "02_cruise_power.png")); n_ind += 1
 
     # 3) Endurance & range
     ax = axes[0, 2]
@@ -843,6 +1009,23 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
         f"{V_c[i_rng]:.1f} m/s)"
     )
 
+    # Individual: endurance & range
+    fi, ai = plt.subplots(figsize=(7, 5))
+    ai.plot(V_c, endur * 60.0, "o-", color="tab:green", label="endurance [min]")
+    ai.set_xlabel("Airspeed [m/s]")
+    ai.set_ylabel("Endurance [min]", color="tab:green")
+    ai.tick_params(axis="y", labelcolor="tab:green")
+    ai.grid(True, alpha=0.3)
+    ai2 = ai.twinx()
+    ai2.plot(V_c, rng, "s-", color="tab:brown", label="range [km]")
+    ai2.set_ylabel("Range [km]", color="tab:brown")
+    ai2.tick_params(axis="y", labelcolor="tab:brown")
+    ai.axvline(V_c[i_end], color="tab:green", ls="--", lw=1, alpha=0.6)
+    ai.axvline(V_c[i_rng], color="tab:brown", ls="--", lw=1, alpha=0.6)
+    ai.set_title(f"Endurance / Range  (best R = {rng[i_rng]:.1f} km @ "
+                 f"{V_c[i_rng]:.1f} m/s)")
+    _save_individual(fi, os.path.join(ind, "03_endurance_range.png")); n_ind += 1
+
     # 4) Trim throttle
     ax = axes[1, 0]
     ax.plot(V_c, thr * 100.0, "o-", color="tab:orange")
@@ -860,6 +1043,22 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
     ax.set_ylim(0, 105)
     ax.grid(True, alpha=0.3)
 
+    # Individual: trim throttle
+    fi, ai = plt.subplots(figsize=(7, 5))
+    ai.plot(V_c, thr * 100.0, "o-", color="tab:orange")
+    if hover is not None:
+        ai.axhline(hover.throttle * 100.0, color="tab:red", ls="--", lw=1.2)
+        ai.annotate(f"hover {hover.throttle*100:.0f}%",
+                    xy=(V_c[0], hover.throttle * 100.0),
+                    xytext=(V_c[0] + (V_c[-1] - V_c[0]) * 0.35,
+                            hover.throttle * 100.0 + 3),
+                    fontsize=8, color="tab:red",
+                    arrowprops=dict(arrowstyle="->", color="tab:red", lw=0.8))
+    ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Trim throttle [%]")
+    ai.set_title("Throttle needed to cruise"); ai.set_ylim(0, 105)
+    ai.grid(True, alpha=0.3)
+    _save_individual(fi, os.path.join(ind, "04_trim_throttle.png")); n_ind += 1
+
     # 5) Battery current per motor
     ax = axes[1, 1]
     ax.plot(V_c, I, "o-", color="tab:red")
@@ -875,6 +1074,19 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
 
+    # Individual: current draw
+    fi, ai = plt.subplots(figsize=(7, 5))
+    ai.plot(V_c, I, "o-", color="tab:red")
+    if motor.Imax is not None:
+        ai.axhline(motor.Imax, color="k", ls="--", lw=1,
+                   label=f"motor Imax = {motor.Imax:g} A")
+    if hover is not None:
+        ai.axhline(hover.current_per_motor_A, color="tab:blue", ls=":", lw=1,
+                   label=f"hover = {hover.current_per_motor_A:.1f} A")
+    ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Current per motor [A]")
+    ai.set_title("Cruise current draw"); ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+    _save_individual(fi, os.path.join(ind, "05_cruise_current.png")); n_ind += 1
+
     # 6) Angle of attack for level flight
     ax = axes[0, 3]
     a_lvl = alpha_level_flight(polar, mass, area, rho, g, V_c)
@@ -884,6 +1096,14 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
     ax.set_ylabel("Alpha [deg]")
     ax.set_title("Angle of attack (L = W)")
     ax.grid(True, alpha=0.3)
+
+    # Individual: angle of attack
+    fi, ai = plt.subplots(figsize=(7, 5))
+    ai.plot(V_c, a_lvl, "o-", color="tab:olive")
+    ai.axhline(0, color="k", lw=0.8)
+    ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Alpha [deg]")
+    ai.set_title("Angle of attack (L = W)"); ai.grid(True, alpha=0.3)
+    _save_individual(fi, os.path.join(ind, "06_angle_of_attack.png")); n_ind += 1
 
     # 7) Rate of climb
     ax = axes[1, 2]
@@ -898,6 +1118,19 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
     ax.set_ylabel("Rate of climb [m/s]")
     ax.set_title("Climb (full throttle)")
     ax.grid(True, alpha=0.3)
+
+    # Individual: rate of climb
+    if V_k.size:
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(V_k, roc, "o-", color="tab:cyan")
+        i_roc = int(np.argmax(roc))
+        ai.plot(V_k[i_roc], roc[i_roc], "*", ms=14, color="tab:orange",
+                label=f"max RoC = {roc[i_roc]:.2f} m/s @ {V_k[i_roc]:.1f} m/s")
+        ai.axhline(0, color="k", lw=0.8)
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Rate of climb [m/s]")
+        ai.set_title("Climb (full throttle)"); ai.grid(True, alpha=0.3)
+        ai.legend(fontsize=9)
+        _save_individual(fi, os.path.join(ind, "07_rate_of_climb.png")); n_ind += 1
 
     # 8) Thrust vs Drag — V_max (powertrain)
     ax = axes[1, 3]
@@ -918,10 +1151,25 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
         ax.set_title("Thrust vs Drag → V_max")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
+
+        # Individual: thrust vs drag
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(V_k, T_max, "o-", color="tab:red", label="Full-throttle thrust")
+        ai.plot(V_k, [c.drag_N for c in valid_k], "s-", color="tab:blue",
+                label="Drag (L = W)")
+        if vmax_pt is not None:
+            ai.axvline(vmax_pt.V, color="tab:green", ls="--", lw=1.5,
+                       label=f"V_max = {vmax_pt.V:.1f} m/s")
+            ai.plot(vmax_pt.V, vmax_pt.drag_N, "*", ms=14,
+                    color="tab:green", zorder=5)
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Force [N]")
+        ai.set_title("Thrust vs Drag → V_max"); ai.grid(True, alpha=0.3)
+        ai.legend(fontsize=9)
+        _save_individual(fi, os.path.join(ind, "08_thrust_vs_drag.png")); n_ind += 1
     else:
         ax.axis("off")
 
-    # 9-10) Control authority panels (row 3)
+    # 9-12) Control authority panels (row 3)
     if n_rows == 3:
         V_ca = np.array([c.V for c in valid_ctrl])
         dT = np.array([c.dT_max_N for c in valid_ctrl])
@@ -950,6 +1198,20 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
+        # Individual: control moment
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(V_ca, M_roll, "o-", color="tab:blue", label="Roll moment")
+        ai.plot(V_ca, M_pitch, "s-", color="tab:red", label="Pitch moment (gross)")
+        ai.plot(V_ca, M_net, "^-", color="tab:green", label="Pitch moment (net)")
+        if np.any(np.isfinite(M_aero)) and np.any(M_aero != 0):
+            ai.axhline(abs(M_aero[0]), color="tab:orange", ls="--", lw=1,
+                       label=f"|M_aero| = {abs(M_aero[0]):.3f} N·m")
+        ai.axhline(0, color="k", lw=0.8)
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Max moment [N·m]")
+        ai.set_title("Control moment (diff. thrust + CG/AC)")
+        ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+        _save_individual(fi, os.path.join(ind, "09_control_moment.png")); n_ind += 1
+
         # 10) Angular acceleration authority
         ax = axes[2, 1]
         ax.plot(V_ca, np.degrees(a_roll), "o-", color="tab:blue",
@@ -962,6 +1224,17 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
+        # Individual: angular acceleration
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(V_ca, np.degrees(a_roll), "o-", color="tab:blue",
+                label=f"Roll (Ixx={plane.get('inertia',{}).get('Ixx','?')})")
+        ai.plot(V_ca, np.degrees(a_pitch), "s-", color="tab:red",
+                label=f"Pitch (Iyy={plane.get('inertia',{}).get('Iyy','?')})")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Max angular accel [deg/s²]")
+        ai.set_title("Angular acceleration authority")
+        ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+        _save_individual(fi, os.path.join(ind, "10_angular_acceleration.png")); n_ind += 1
+
         # 11) Control power ratio
         ax = axes[2, 2]
         ax.plot(V_ca, cp_roll, "o-", color="tab:blue", label="Roll CP")
@@ -971,6 +1244,14 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
         ax.set_title("Control power ratio")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
+
+        # Individual: control power ratio
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.plot(V_ca, cp_roll, "o-", color="tab:blue", label="Roll CP")
+        ai.plot(V_ca, cp_pitch, "s-", color="tab:red", label="Pitch CP")
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("M / (q·S·c)")
+        ai.set_title("Control power ratio"); ai.grid(True, alpha=0.3); ai.legend(fontsize=9)
+        _save_individual(fi, os.path.join(ind, "11_control_power_ratio.png")); n_ind += 1
 
         # 12) ΔT budget per motor
         ax = axes[2, 3]
@@ -987,10 +1268,28 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
+        # Individual: thrust budget
+        fi, ai = plt.subplots(figsize=(7, 5))
+        ai.fill_between(V_ca, T_trim - dT, T_trim + dT,
+                        alpha=0.25, color="tab:green", label="±ΔT envelope")
+        ai.plot(V_ca, T_trim, "o-", color="tab:blue", label="T_trim/motor")
+        ai.plot(V_ca, T_max_m, "s--", color="tab:red", label="T_max/motor")
+        ai.axhline(0, color="k", lw=0.8)
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Thrust per motor [N]")
+        ai.set_title("Thrust budget per motor"); ai.grid(True, alpha=0.3)
+        ai.legend(fontsize=9)
+        _save_individual(fi, os.path.join(ind, "12_thrust_budget.png")); n_ind += 1
+
+    # Individual: characteristic speeds vs altitude
+    plot_altitude_speeds(polar, mass, area, g,
+                         save_path=os.path.join(ind, "13_altitude_speeds.png"))
+    n_ind += 1
+
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     fig.savefig(save_path, dpi=150)
     print(f"Saved performance plot to {save_path}")
+    print(f"Saved {n_ind} individual plots to {ind}/")
     if show:
         plt.show()
     else:
@@ -1079,6 +1378,20 @@ def main() -> None:
                  hover, cruise, climb, usable_fraction=args.usable,
                  ctrl=ctrl)
 
+    # Altitude speed analysis
+    alt_pts = altitude_speed_sweep(
+        polar, plane["mass"], plane["area"],
+        g=plane.get("gravity", 9.81),
+    )
+    print("\n--- CHARACTERISTIC SPEEDS vs ALTITUDE ---")
+    print("   Alt [m]   ρ [kg/m³]  V_stall  V_endurance  V_best_range")
+    print("  " + "-" * 58)
+    for p in alt_pts[::5]:  # every 500 m
+        print(f"  {p.altitude_m:6.0f}    {p.rho:7.4f}    "
+              f"{p.V_stall:6.2f}     {p.V_best_endurance:6.2f}       "
+              f"{p.V_best_range:6.2f}")
+    print("=" * 70)
+
     if not args.no_plot:
         save_path = _auto_plot_path(
             args.prop_file, args.motor_xml, args.battery_xml,
@@ -1088,6 +1401,13 @@ def main() -> None:
                          hover, cruise, climb,
                          save_path=save_path, show=args.show,
                          ctrl=ctrl)
+        # Standalone altitude-speed plot
+        alt_plot = os.path.splitext(save_path)[0] + "__altitude_speeds.png"
+        plot_altitude_speeds(
+            polar, plane["mass"], plane["area"],
+            g=plane.get("gravity", 9.81),
+            save_path=alt_plot, show=args.show,
+        )
 
 
 if __name__ == "__main__":
