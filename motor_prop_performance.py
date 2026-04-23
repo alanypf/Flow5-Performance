@@ -219,6 +219,16 @@ class Motor:
         I0_eff = self.I0 * (rpm / no_load_rpm) if no_load_rpm > 0 else self.I0
         return (I - I0_eff) * self.Kt
 
+    def stall_torque(self, V_eff: float) -> float:
+        """Stall (locked-rotor) shaft torque [N·m] at terminal voltage V_eff.
+
+        At zero rpm there is no back-EMF, so I_stall = V_eff / R, and the
+        speed-scaled no-load losses vanish — stall torque is simply Kt * I_stall.
+        Note: the stall current this implies (V_eff / R) is typically far above
+        Imax; this is an instantaneous/theoretical value, not a continuous rating.
+        """
+        return V_eff * self.Kt / self.R
+
 
 def load_motor(path: str) -> Motor:
     tree = ET.parse(path)
@@ -964,6 +974,11 @@ def main() -> None:
           f"P={prop.pitch_in}in)")
     print(f"Motor:     {motor.name}  Kv={motor.Kv} rpm/V  R={motor.R} ohm  "
           f"I0={motor.I0} A  (x{motor.count})")
+    tau_stall = motor.stall_torque(V_oc)
+    I_stall = V_oc / motor.R
+    print(f"           stall @ V_oc={V_oc:.2f}V:  "
+          f"tau={tau_stall:.3f} N·m  I={I_stall:.1f} A  "
+          f"(Kt={motor.Kt*1000:.2f} mN·m/A)")
     print(f"Battery:   {battery.name}  {battery.chemistry} "
           f"{battery.series}S{battery.parallel}P  "
           f"{battery.capacity_Ah:.2f} Ah  "

@@ -278,6 +278,7 @@ class CruisePoint:
     CL_req: float
     drag_N: float
     thrust_per_motor_N: float
+    torque_per_motor_Nm: float
     throttle: float
     rpm: float
     current_per_motor_A: float
@@ -318,6 +319,7 @@ def cruise_sweep(polar: dict, plane: dict, motor: Motor, prop: Propeller,
             CL_req=2.0 * mass * g / (rho * V * V * area),
             drag_N=float(D),
             thrust_per_motor_N=op.thrust_N,
+            torque_per_motor_Nm=op.torque_Nm,
             throttle=t,
             rpm=op.rpm,
             current_per_motor_A=op.current_A,
@@ -343,6 +345,8 @@ class ClimbPoint:
     roc_ms: float
     TW_max: float          # full-throttle thrust / weight at this V
     TW_cruise: float       # drag / weight (trim thrust fraction) at this V
+    rpm_max: float         # full-throttle (= max) prop rpm at this V
+    torque_per_motor_Nm: float  # full-throttle (= max available) prop torque at this V
 
 
 def climb_sweep(polar: dict, plane: dict, motor: Motor, prop: Propeller,
@@ -377,6 +381,8 @@ def climb_sweep(polar: dict, plane: dict, motor: Motor, prop: Propeller,
             roc_ms=roc,
             TW_max=T_total / W,
             TW_cruise=float(D) / W,
+            rpm_max=op.rpm,
+            torque_per_motor_Nm=op.torque_Nm,
         ))
     return out
 
@@ -856,6 +862,138 @@ def plot_altitude_speeds(polar: dict, mass: float, area: float,
         plt.close(fig)
 
 
+def plot_motor_rpm_vs_airspeed(motor: Motor, battery: Battery,
+                               hover: HoverPoint | None,
+                               cruise: list[CruisePoint | None],
+                               climb: list[ClimbPoint | None],
+                               save_path: str | None = None,
+                               show: bool = False,
+                               ax=None) -> None:
+    """Plot full-throttle (max) and cruise-trim motor RPM vs airspeed.
+
+    Overlays:
+      * full-throttle RPM curve (from climb sweep — the max at each V)
+      * cruise-trim RPM curve (from cruise sweep — RPM needed to hold level flight)
+      * hover RPM as a horizontal marker (V = 0)
+      * theoretical no-load ceiling Kv · V_nominal as a dashed reference
+    """
+    import matplotlib.pyplot as plt
+
+    valid_k = [c for c in climb if c is not None]
+    valid_c = [c for c in cruise if c is not None]
+
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(7, 5))
+    else:
+        fig = ax.figure
+
+    if valid_k:
+        V_k = np.array([c.V for c in valid_k])
+        rpm_max = np.array([c.rpm_max for c in valid_k])
+        ax.plot(V_k, rpm_max, "o-", color="tab:red",
+                label="Max RPM (full throttle)")
+
+    if valid_c:
+        V_c = np.array([c.V for c in valid_c])
+        rpm_trim = np.array([c.rpm for c in valid_c])
+        ax.plot(V_c, rpm_trim, "s-", color="tab:blue",
+                label="Trim RPM (cruise)")
+
+    if hover is not None:
+        ax.axhline(hover.rpm, color="tab:green", ls=":", lw=1.2,
+                   label=f"Hover RPM = {hover.rpm:.0f}")
+
+    rpm_noload = motor.Kv * battery.V_nominal
+    ax.axhline(rpm_noload, color="k", ls="--", lw=1, alpha=0.6,
+               label=f"Kv·V_nom = {rpm_noload:.0f} (no-load ceiling)")
+
+    ax.set_xlabel("Airspeed [m/s]")
+    ax.set_ylabel("Motor / prop RPM")
+    ax.set_title("Motor RPM vs airspeed")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    if standalone:
+        fig.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.savefig(save_path, dpi=200, bbox_inches="tight")
+            print(f"Saved motor-RPM plot to {save_path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+
+def plot_torque_thrust_vs_airspeed(n_motors: int,
+                                   hover: HoverPoint | None,
+                                   cruise: list[CruisePoint | None],
+                                   climb: list[ClimbPoint | None],
+                                   save_path: str | None = None,
+                                   show: bool = False) -> None:
+    """Plot per-motor thrust and torque vs airspeed — trim vs available.
+
+    Two panels side-by-side:
+      * Thrust per motor: trim (cruise, from cruise sweep) and available
+        (full-throttle, from climb sweep).
+      * Torque per motor: same two curves.
+
+    Hover values (V = 0, trim = hover) are shown as markers where known.
+    """
+    import matplotlib.pyplot as plt
+
+    valid_c = [c for c in cruise if c is not None]
+    valid_k = [c for c in climb if c is not None]
+
+    fig, (ax_t, ax_q) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # --- Thrust per motor ---
+    if valid_k:
+        V_k = np.array([c.V for c in valid_k])
+        T_avail = np.array([c.T_max_total_N for c in valid_k]) / n_motors
+        ax_t.plot(V_k, T_avail, "o-", color="tab:red",
+                  label="Available (full throttle)")
+    if valid_c:
+        V_c = np.array([c.V for c in valid_c])
+        T_trim = np.array([c.thrust_per_motor_N for c in valid_c])
+        ax_t.plot(V_c, T_trim, "s-", color="tab:blue", label="Trim (cruise)")
+    if hover is not None:
+        ax_t.plot(0.0, hover.thrust_per_motor_N, "o", color="tab:green",
+                  ms=8, label=f"Hover trim = {hover.thrust_per_motor_N:.2f} N")
+    ax_t.axhline(0, color="k", lw=0.8)
+    ax_t.set_xlabel("Airspeed [m/s]")
+    ax_t.set_ylabel("Thrust per motor [N]")
+    ax_t.set_title(f"Thrust per motor vs airspeed (N = {n_motors})")
+    ax_t.grid(True, alpha=0.3)
+    ax_t.legend(fontsize=9)
+
+    # --- Torque per motor ---
+    if valid_k:
+        Q_avail = np.array([c.torque_per_motor_Nm for c in valid_k])
+        ax_q.plot(V_k, Q_avail, "o-", color="tab:red",
+                  label="Available (full throttle)")
+    if valid_c:
+        Q_trim = np.array([c.torque_per_motor_Nm for c in valid_c])
+        ax_q.plot(V_c, Q_trim, "s-", color="tab:blue", label="Trim (cruise)")
+    ax_q.axhline(0, color="k", lw=0.8)
+    ax_q.set_xlabel("Airspeed [m/s]")
+    ax_q.set_ylabel("Torque per motor [N·m]")
+    ax_q.set_title(f"Torque per motor vs airspeed (N = {n_motors})")
+    ax_q.grid(True, alpha=0.3)
+    ax_q.legend(fontsize=9)
+
+    fig.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Saved torque/thrust plot to {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def _save_individual(fig, path):
     """Save a single-plot figure and close it."""
     import matplotlib.pyplot as plt
@@ -1285,6 +1423,20 @@ def plot_performance(plane: dict, polar: dict, motor: Motor, prop: Propeller,
                          save_path=os.path.join(ind, "13_altitude_speeds.png"))
     n_ind += 1
 
+    # Individual: motor RPM vs airspeed
+    plot_motor_rpm_vs_airspeed(
+        motor, battery, hover, cruise, climb,
+        save_path=os.path.join(ind, "14_motor_rpm_vs_airspeed.png"),
+    )
+    n_ind += 1
+
+    # Individual: torque & thrust (trim vs available) vs airspeed
+    plot_torque_thrust_vs_airspeed(
+        n_motors, hover, cruise, climb,
+        save_path=os.path.join(ind, "15_torque_thrust_vs_airspeed.png"),
+    )
+    n_ind += 1
+
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     fig.savefig(save_path, dpi=150)
@@ -1407,6 +1559,18 @@ def main() -> None:
             polar, plane["mass"], plane["area"],
             g=plane.get("gravity", 9.81),
             save_path=alt_plot, show=args.show,
+        )
+        # Standalone motor-RPM plot
+        rpm_plot = os.path.splitext(save_path)[0] + "__motor_rpm.png"
+        plot_motor_rpm_vs_airspeed(
+            motor, battery, hover, cruise, climb,
+            save_path=rpm_plot, show=args.show,
+        )
+        # Standalone torque & thrust plot
+        tq_plot = os.path.splitext(save_path)[0] + "__torque_thrust.png"
+        plot_torque_thrust_vs_airspeed(
+            n_motors, hover, cruise, climb,
+            save_path=tq_plot, show=args.show,
         )
 
 
