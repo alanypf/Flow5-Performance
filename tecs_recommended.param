@@ -1,0 +1,44 @@
+# ArduPilot fixed-wing TECS / airspeed starting points
+# Source SDF      : model-aero-VITERNA-m.sdf
+# Propeller       : 7x11E
+# Motor           : T-Motor V3120 KV500 x 4
+# Battery         : 12S1P LiPo  V_nom=44.40V  cap=6.20Ah
+# Mass            : 4.250 kg
+# V_stall         : 48.15 m/s
+# V_max           : 90.00 m/s
+# V_cruise (used) : 57.80 m/s (min_power)
+# Cruise throttle : 47.8 %
+# Max climb rate  : 145.38 m/s @ 70.0 m/s
+# Min sink rate   : 4.46 m/s @ 50.0 m/s
+# 
+# Format: NAME,VALUE  -- compatible with Mission Planner /
+# QGroundControl 'Load from file'. Lines starting with '#' are
+# comments. Numeric values follow the standard ArduPilot units.
+#
+AIRSPEED_MIN,57.8   # 1.2 * V_stall (autopilot lower speed limit, m/s)
+AIRSPEED_CRUISE,57.8   # trim/cruise airspeed at min pack power (m/s)
+AIRSPEED_MAX,81   # 0.9 * V_max (autopilot upper speed limit, m/s)
+ARSPD_FBW_MIN,57.8   # legacy alias for AIRSPEED_MIN (pre-4.4 firmware)
+ARSPD_FBW_MAX,81   # legacy alias for AIRSPEED_MAX (pre-4.4 firmware)
+TRIM_ARSPD_CM,5778   # legacy AIRSPEED_CRUISE expressed in cm/s
+TRIM_THROTTLE,48   # throttle (%) needed for level flight at cruise speed
+THR_MIN,0   # minimum throttle in AUTO modes (%)
+THR_MAX,100   # maximum throttle in AUTO modes (%)
+THR_SLEWRATE,100   # throttle rate of change (% / s)
+TECS_CLMB_MAX,145.4   # max sustained climb rate, full throttle (m/s)
+TECS_SINK_MIN,4.46   # best-glide sink rate, throttle = 0 (m/s)
+TECS_SINK_MAX,6.5   # max commanded descent rate (m/s)
+TECS_LAND_ARSPD,62.6   # approach airspeed = 1.3 * V_stall (m/s)
+TECS_LAND_THR,0   # throttle on final approach (%)
+TECS_PITCH_MAX,25   # max pitch TECS commands in climb (deg)
+TECS_PITCH_MIN,-15   # min pitch TECS commands in descent (deg)
+TECS_SPDWEIGHT,1   # 1=balance speed/height, 2=hold speed only (default 1)
+TECS_TIME_CONST,5   # energy filter time constant (s) -- tune in flight
+TECS_THR_DAMP,0.5   # throttle damping gain -- tune in flight
+TECS_INTEG_GAIN,0.3   # integrator gain -- tune in flight
+TECS_PTCH_DAMP,0.3   # pitch damping gain -- tune in flight
+TECS_RLL2THR,10   # throttle increase in turns (default 10)
+TECS_VERT_ACC,7   # vertical accel limit (m/s^2, default 7)
+PTCH_LIM_MAX_DEG,30   # absolute max nose-up attitude (deg)
+PTCH_LIM_MIN_DEG,-25   # absolute max nose-down attitude (deg)
+STALL_PREVENTION,1   # 1=enable airspeed-based stall prevention
