@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 
+from config_paths import find_config
 from plot_flow5 import load_plane_xml, load_polar
 
 
@@ -485,6 +486,18 @@ def plot_fits(polar: dict, p: AldParams,
 
 
 def main() -> None:
+    """CLI: fit Gazebo AdvancedLiftDrag (ALD) plugin coefficients from a Flow5 polar.
+
+    Inputs : Flow5 polar .txt + plane.xml (+ wingspan).  Output: an SDF
+             <plugin> snippet (a0, cla, cda, cma, alpha_stall, post-stall
+             slopes...) ready to paste into the model.
+
+    This is the model-BUILDING step, and the inverse of the analysis scripts:
+      * sdf_aero_performance.py / compare_logs.py READ the SDF coefficients
+        this script writes.
+      * performance.py works straight from the polar without the SDF round-trip.
+      * plot_flow5.py plots the same polar but fits nothing.
+    """
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("polar_file", help="Flow5 polar .txt (alpha sweep)")
     ap.add_argument("--plane", default="plane.xml", help="Plane parameter XML")
@@ -516,9 +529,9 @@ def main() -> None:
     ap.add_argument("--show", action="store_true", help="Show plot interactively")
     args = ap.parse_args()
 
-    polar = load_polar(Path(args.polar_file))
+    polar = load_polar(Path(find_config(args.polar_file, "aero")))
     plane = {"rho": 1.225, "gravity": 9.81}
-    plane.update(load_plane_xml(Path(args.plane)))
+    plane.update(load_plane_xml(Path(find_config(args.plane, "planes"))))
 
     cp_offset = tuple(args.cp_offset) if args.cp_offset is not None else None
 

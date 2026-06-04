@@ -62,6 +62,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from config_paths import find_config
 from motor_prop_performance import (
     Battery,
     Motor,
@@ -1041,6 +1042,21 @@ def _print_summary(aero: AeroModel, mass: float, motor: Motor,
 
 
 def main() -> None:
+    """CLI: flight-envelope performance from a Gazebo SDF aero model + powertrain.
+
+    Inputs : SDF model (AdvancedLiftDrag block + link mass) + prop + motor +
+             battery.  Output: two cruise solves side by side - the SDF's
+             integrated prop ("Gazebo default", no battery/losses) vs the
+             supplied powertrain.
+
+    Versus the siblings:
+      * performance.py           - identical analysis, but aero comes from a
+        Flow5 polar; use THIS to evaluate the exact model the sim flies.
+      * gazebo_ald_params.py     - the inverse: it FITS the SDF coefficients
+        that this script reads, from a Flow5 polar.
+      * ardupilot_tecs_params.py - consumes the same SDF aero but emits
+        ArduPilot params instead of performance tables.
+    """
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--sdf", default="model-aero-VITERNA-m.sdf",
@@ -1075,17 +1091,18 @@ def main() -> None:
                    help="Skip plt.show() (useful when only saving figures)")
     args = p.parse_args()
 
-    aero, sdf_mass, propulsion, info = load_sdf_model(args.sdf)
+    sdf_path = find_config(args.sdf, "aero")
+    aero, sdf_mass, propulsion, info = load_sdf_model(sdf_path)
     mass = args.mass if args.mass is not None else sdf_mass
 
-    prop_provided = load_propeller(args.prop)
-    motor = load_motor(args.motor)
-    battery = load_battery(args.battery)
+    prop_provided = load_propeller(find_config(args.prop, "propellers"))
+    motor = load_motor(find_config(args.motor, "motors"))
+    battery = load_battery(find_config(args.battery, "batteries"))
 
     # Resolve the propeller CSV that the SDF actually uses, falling back to
     # the provided .txt prop (still the same physical 7x11E data) if the CSV
     # can't be located on disk.
-    csv_path = args.gazebo_prop or resolve_sdf_uri(propulsion.perf_file_uri, args.sdf)
+    csv_path = args.gazebo_prop or resolve_sdf_uri(propulsion.perf_file_uri, sdf_path)
     if csv_path and os.path.exists(csv_path):
         prop_gazebo = load_propeller_csv(csv_path)
         print(f"Gazebo prop CSV resolved -> {csv_path}")

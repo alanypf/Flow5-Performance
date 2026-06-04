@@ -3,7 +3,7 @@
 Usage:
     py -3 plot_flow5.py [input.txt] [-o OUTPUT_DIR]
 
-If no input file is given, every ``*.txt`` in the script directory is processed.
+If no input file is given, every ``*.txt`` in ``config/aero/`` is processed.
 Plots for each input are written to ``OUTPUT_DIR/<input-stem>/`` (default
 ``OUTPUT_DIR`` is ``./plots``).
 """
@@ -16,8 +16,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from config_paths import CONFIG_DIR, find_config
+
 HERE = Path(__file__).parent
-DEFAULT_PLANE_XML = HERE / "plane.xml"
+AERO_DIR = CONFIG_DIR / "aero"
+DEFAULT_PLANE_XML = CONFIG_DIR / "planes" / "plane.xml"
 
 
 def load_plane_xml(path: Path) -> dict:
@@ -646,12 +649,12 @@ def parse_args(argv):
         description="Generate report-quality plots from Flow5 polar text files.")
     p.add_argument("inputs", nargs="*", type=Path,
                    help="Flow5 .txt result file(s). If omitted, all *.txt "
-                        "files next to the script are processed.")
+                        "files in config/aero/ are processed.")
     p.add_argument("-o", "--output-dir", type=Path, default=HERE / "plots",
                    help="Directory to write plots into (default: ./plots). "
                         "Each input gets its own subfolder.")
     p.add_argument("--plane", type=Path, default=DEFAULT_PLANE_XML,
-                   help="Plane parameter XML file (default: ./plane.xml). "
+                   help="Plane parameter XML file (default: config/planes/plane.xml). "
                         "Provides mass, area, chord, rho, gravity.")
     p.add_argument("--mass", type=float, default=None,
                    help="Aircraft mass in kg. Overrides plane.xml; "
@@ -676,27 +679,36 @@ def resolve_inputs(inputs):
         for f in inputs:
             path = f if f.is_absolute() else (Path.cwd() / f)
             if not path.exists():
-                # Fall back to script directory for convenience.
-                alt = HERE / f.name
-                if alt.exists():
-                    path = alt
+                # Fall back to config/aero/ (and the rest of config/).
+                path = Path(find_config(f.name, "aero"))
             if not path.exists():
                 print(f"error: input file not found: {f}", file=sys.stderr)
                 sys.exit(1)
             resolved.append(path)
         return resolved
-    found = sorted(HERE.glob("*.txt"))
+    found = sorted(AERO_DIR.glob("*.txt"))
     if not found:
-        print(f"error: no .txt files found in {HERE}", file=sys.stderr)
+        print(f"error: no .txt files found in {AERO_DIR}", file=sys.stderr)
         sys.exit(1)
     return found
 
 
 def main(argv=None):
+    """CLI: render report-quality plots from Flow5 polar .txt files (no propulsion).
+
+    Inputs : one or more Flow5 polars (defaults to config/aero/*.txt) +
+             optional plane.xml.  Output: PNG plots under OUTPUT_DIR/<stem>/.
+
+    Pure visualisation - the only sibling CLI that computes nothing about the
+    powertrain or the sim model:
+      * gazebo_ald_params.py turns the same polar into SDF coefficients.
+      * performance.py turns it into a flight-performance envelope.
+    Also exposes load_plane_xml()/load_polar(), which those scripts import.
+    """
     args = parse_args(argv)
     style()
     params = {"rho": 1.225, "gravity": 9.81}
-    params.update(load_plane_xml(args.plane))
+    params.update(load_plane_xml(Path(find_config(args.plane, "planes"))))
     for key in ("mass", "area", "chord", "rho", "gravity"):
         val = getattr(args, key)
         if val is not None:

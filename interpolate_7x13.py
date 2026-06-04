@@ -4,6 +4,10 @@ Linear interpolation at the midpoint (pitch 13 between 11 and 15).
 """
 import re
 
+from config_paths import CONFIG_DIR, find_config
+
+PROP_DIR = CONFIG_DIR / "propellers"
+
 def parse_file(filepath):
     """Parse a PER3 performance file into structured RPM sections."""
     with open(filepath, 'r') as f:
@@ -119,8 +123,8 @@ def format_output(sections):
 
 
 if __name__ == "__main__":
-    sec11 = parse_file("PER3_7x11E.txt")
-    sec15 = parse_file("PER3_7x15E.txt")
+    sec11 = parse_file(find_config("PER3_7x11E.txt", "propellers"))
+    sec15 = parse_file(find_config("PER3_7x15E.txt", "propellers"))
 
     print(f"7x11E: {len(sec11)} RPM sections, RPMs: {[s[0] for s in sec11]}")
     print(f"7x15E: {len(sec15)} RPM sections, RPMs: {[s[0] for s in sec15]}")
@@ -130,7 +134,8 @@ if __name__ == "__main__":
 
     output = format_output(interp)
 
-    with open("PER3_7x13E.txt", "w") as f:
+    out_path = PROP_DIR / "PER3_7x13E.txt"
+    with open(out_path, "w") as f:
         f.write(output)
 
-    print("Written PER3_7x13E.txt")
+    print(f"Written {out_path}")

@@ -60,6 +60,7 @@ from motor_prop_performance import (
     load_propeller,
     solve_operating_point,
 )
+from config_paths import find_config
 from sdf_aero_performance import (
     AeroModel,
     CruisePoint,
@@ -715,6 +716,18 @@ def print_recommendation(rec: TecsRecommendation) -> None:
 
 
 def main() -> None:
+    """CLI: recommended ArduPilot TECS / airspeed params from SDF aero + powertrain.
+
+    Inputs : SDF model + prop + motor + battery (the same stack as
+             sdf_aero_performance.py).  Output: a Mission-Planner .param file
+             plus a printed report - NOT a performance table.
+
+    Versus the siblings:
+      * sdf_aero_performance.py - same inputs and cruise solve, but it reports
+        performance; THIS turns that envelope into controller parameters.
+      * gazebo_ald_params.py    - also emits sim/firmware config, but targets
+        the Gazebo LiftDrag plugin (a0/cla/...) rather than ArduPilot TECS.
+    """
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -758,12 +771,12 @@ def main() -> None:
                    help="Display plots interactively (default: save only)")
     args = p.parse_args()
 
-    aero, sdf_mass, propulsion, _info = load_sdf_model(args.sdf)
+    aero, sdf_mass, propulsion, _info = load_sdf_model(find_config(args.sdf, "aero"))
     mass = args.mass if args.mass is not None else sdf_mass
 
-    prop = load_propeller(args.prop)
-    motor = load_motor(args.motor)
-    battery = load_battery(args.battery)
+    prop = load_propeller(find_config(args.prop, "propellers"))
+    motor = load_motor(find_config(args.motor, "motors"))
+    battery = load_battery(find_config(args.battery, "batteries"))
 
     V_arr = np.arange(args.vmin, args.vmax + 1e-9, args.vstep)
 

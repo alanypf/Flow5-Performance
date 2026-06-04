@@ -55,6 +55,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from config_paths import find_config
+
 
 MPH_TO_MS = 0.44704
 
@@ -934,6 +936,18 @@ def _print_throttle_table(throttles: np.ndarray,
 
 
 def main() -> None:
+    """CLI: motor + propeller + battery operating point (no airframe).
+
+    Inputs : prop .txt + motor.xml + battery.xml.  Output: thrust / rpm /
+    current / shaft & electric power / efficiency vs throttle (and airspeed).
+
+    This is the lowest-level propulsion solver in the toolkit; the others
+    build on its solve_operating_point():
+      * performance.py / sdf_aero_performance.py add an airframe + aero polar
+        on top to turn thrust into cruise / climb / V_max.
+      * ardupilot_tecs_params.py uses it to predict cruise throttle.
+    Reach for THIS when you only care about the prop/motor/battery, not flight.
+    """
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("prop_file", help="APC-format propeller data file")
     ap.add_argument("motor_xml", help="Motor spec XML file")
@@ -962,11 +976,11 @@ def main() -> None:
                     help="Number of motors (overrides XML <count>; default 1)")
     args = ap.parse_args()
 
-    prop = load_propeller(args.prop_file)
-    motor = load_motor(args.motor_xml)
+    prop = load_propeller(find_config(args.prop_file, "propellers"))
+    motor = load_motor(find_config(args.motor_xml, "motors"))
     if args.motors is not None:
         motor.count = args.motors
-    battery = load_battery(args.battery_xml)
+    battery = load_battery(find_config(args.battery_xml, "batteries"))
 
     V_oc = battery.V_empty + args.soc * (battery.V_full - battery.V_empty)
 
