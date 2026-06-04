@@ -12,8 +12,14 @@ The two flights are never assumed to share a clock:
                   by cross-correlation of pitch rate (lag recovered, not assumed)
   * time-to-target-airspeed -> a per-log scalar, compared directly (no alignment)
 
+  * transition tracks -> forward (hover->cruise) and back (cruise->hover) compared
+                  separately: XY ground track, position-controller XY overshoot of
+                  the commanded stop point, and pitch, real vs SITL. The back
+                  transition's overshoot is the post-stall-drag (CDa_stall) probe.
+
 Outputs (into --outdir): drag-signature plot, lift/trim plot (with the SDF-predicted
-curve overlaid), transition overlay plot, and report.txt (metrics + tuning map).
+curve overlaid), transition overlay plot, transition-tracks plot, and report.txt
+(metrics + tuning map).
 
 --real / --sitl accept EITHER a chop_log CSV directory OR a raw .bin log. A .bin is
 auto-chopped (full data: tier 3 + all sensors) into <outdir>/<logname>_chopped and
@@ -308,6 +314,56 @@ def climbrate_series(log: LogData):
     if log.has("XKF1", "VD"):
         return log.rel("XKF1"), -log.col("XKF1", "VD")
     return None, None
+
+
+_EARTH_R = 6378137.0  # WGS84 equatorial radius (m), good enough for a local plane
+
+
+def position_ned_series(log: LogData):
+    """Local NED position (north, east, down) in metres vs time.
+
+    Prefer the EKF estimate XKF1.PN/PE/PD (already in a local NED frame relative
+    to the EKF origin, primary core only). Fall back to POS lat/lng/alt projected
+    onto a tangent plane at the first sample, then AHR2. Returns
+    (rel_time, north, east, down, source) or five Nones.
+    """
+    if log.has("XKF1", "PN", "PE", "PD"):
+        rel = log.rel("XKF1")
+        N, E, D = (log.col("XKF1", c) for c in ("PN", "PE", "PD"))
+        if "C" in log.msgs["XKF1"]:                      # one row per EKF core
+            core = log.col("XKF1", "C")
+            vals, counts = np.unique(core, return_counts=True)
+            sel = core == vals[int(np.argmax(counts))]   # busiest (primary) core
+            rel, N, E, D = rel[sel], N[sel], E[sel], D[sel]
+        return rel, N, E, D, "XKF1.PN/PE/PD"
+    for mtype, alt in (("POS", "Alt"), ("AHR2", "Alt")):
+        if log.has(mtype, "Lat", "Lng", alt):
+            rel = log.rel(mtype)
+            lat, lng = log.col(mtype, "Lat"), log.col(mtype, "Lng")
+            alt_m = log.col(mtype, alt)
+            lat0 = float(lat[0])
+            north = np.radians(lat - lat0) * _EARTH_R
+            east = np.radians(lng - float(lng[0])) * _EARTH_R * math.cos(math.radians(lat0))
+            return rel, north, east, -(alt_m - float(alt_m[0])), f"{mtype} lat/lng/alt"
+    return None, None, None, None, None
+
+
+def pos_track_error_series(log: LogData):
+    """Horizontal position-controller tracking error |actual - target| (m) vs time.
+
+    From PSCN/PSCE (the QuadPlane/VTOL position controller, active through the back
+    transition): PN/PE are the achieved NE position, TPN/TPE the commanded target.
+    Their horizontal distance is exactly the XY overshoot of the commanded stop
+    point. Returns (rel_time, err_m, source) or three Nones (fixed-wing-only logs
+    won't carry PSC).
+    """
+    if log.has("PSCN", "PN", "TPN") and log.has("PSCE", "PE", "TPE"):
+        rel = log.rel("PSCN")
+        eN = log.col("PSCN", "PN") - log.col("PSCN", "TPN")
+        eE = interp_at(log.rel("PSCE"),
+                       log.col("PSCE", "PE") - log.col("PSCE", "TPE"), rel)
+        return rel, np.hypot(eN, eE), "PSCN/PSCE actual-target"
+    return None, None, None
 
 
 def interp_at(t_src, y_src, t_query):
@@ -721,6 +777,146 @@ def transition_metrics(real: LogData, sitl: LogData, pre: float, post: float,
 
 
 # ---------------------------------------------------------------------------
+# Transition ground-track + attitude (position-overshoot focus)
+#
+# The forward (hover->cruise) and back (cruise->hover) transitions are compared
+# separately because the back transition is the one that exposes post-stall drag:
+# the aircraft pitches up into deep stall to decelerate, and if SITL under-models
+# the high-AoA drag it sails past the hover point -> XY overshoot. We quantify the
+# horizontal excursion from the settle point and the attitude track, real vs SITL,
+# lag-aligned on pitch rate (the longitudinal transition axis) like the forward
+# metrics above.
+# ---------------------------------------------------------------------------
+@dataclass
+class TransitionTrack:
+    kind: str                       # "forward" | "back"
+    have: bool = False
+    lag_s: float = float("nan")
+    xcorr_peak: float = float("nan")
+    grid: np.ndarray = None         # time relative to the transition event (s)
+    # per-log horizontal ground track (m) referenced to the position AT the event,
+    # plus horizontal distance r=hypot(dN,dE) and pitch (deg)
+    real_n: np.ndarray = None
+    real_e: np.ndarray = None
+    real_r: np.ndarray = None
+    real_pitch: np.ndarray = None
+    sitl_n: np.ndarray = None
+    sitl_e: np.ndarray = None
+    sitl_r: np.ndarray = None
+    sitl_pitch: np.ndarray = None
+    pos_src: str = ""
+    # position-controller horizontal tracking error |actual-target| (m), the XY
+    # overshoot of the commanded stop point (None if PSC not logged)
+    real_perr: np.ndarray = None
+    sitl_perr: np.ndarray = None
+    perr_src: str = ""
+    overshoot_real: float = float("nan")   # peak tracking error over the window
+    overshoot_sitl: float = float("nan")
+    overshoot_ratio: float = float("nan")  # SITL / real
+    rms_horiz: float = float("nan")        # RMS |r_sitl - r_real| trajectory diff
+    rms_pitch: float = float("nan")        # RMS pitch difference (lag-aligned)
+    note: str = ""
+
+
+def _lag_on_pitchrate(real: LogData, sitl: LogData, t_real: float, t_sitl: float,
+                      pre: float, post: float, dt: float):
+    """Pitch-rate cross-correlation lag (s) and peak between the two event windows."""
+    if not (real.has("RATE", "P") and sitl.has("RATE", "P")):
+        return 0.0, float("nan")
+    _, r = resample_window(real.rel("RATE"), real.col("RATE", "P"),
+                           t_real - pre, t_real + post, dt)
+    _, s = resample_window(sitl.rel("RATE"), sitl.col("RATE", "P"),
+                           t_sitl - pre, t_sitl + post, dt)
+    if r is None or s is None:
+        return 0.0, float("nan")
+    return best_lag(r, s, dt)
+
+
+def _track_on_grid(log: LogData, t_event: float, grid: np.ndarray, pre: float,
+                   shift: float = 0.0):
+    """Ground track + pitch for one log on `grid` (time relative to t_event).
+
+    Positions are referenced to the aircraft position AT the event (grid==pre),
+    so both logs start their excursion from a common origin regardless of where
+    the EKF origin sits. Returns (n, e, r, pitch, src) or None.
+    """
+    t_pos, N, E, _, src = position_ned_series(log)
+    if t_pos is None:
+        return None
+    base = grid + (t_event - pre) + shift
+    n = interp_at(t_pos, N, base)
+    e = interp_at(t_pos, E, base)
+    i0 = int(np.argmin(np.abs(grid - pre)))      # sample at the event
+    n = n - n[i0]
+    e = e - e[i0]
+    r = np.hypot(n, e)
+    pitch = (interp_at(log.rel("ATT"), log.col("ATT", "Pitch"), base)
+             if log.has("ATT", "Pitch") else np.full(len(grid), np.nan))
+    return n, e, r, pitch, src
+
+
+def _transition_track(real: LogData, sitl: LogData, kind: str,
+                      t_real: float | None, t_sitl: float | None,
+                      pre: float, post: float, dt: float) -> TransitionTrack:
+    tt = TransitionTrack(kind=kind)
+    if t_real is None or t_sitl is None:
+        tt.note = f"missing {'Transition VTOL done' if kind == 'back' else 'Transition FW done'} event in real or SITL"
+        return tt
+    lag, peak = _lag_on_pitchrate(real, sitl, t_real, t_sitl, pre, post, dt)
+    tt.lag_s, tt.xcorr_peak = lag, peak
+    grid = np.arange(0.0, pre + post, dt)
+    tt.grid = grid
+    rt = _track_on_grid(real, t_real, grid, pre, shift=0.0)
+    st = _track_on_grid(sitl, t_sitl, grid, pre, shift=lag)  # shift SITL onto real
+    if rt is None or st is None:
+        tt.note = "no position signal (XKF1/POS/AHR2) in real or SITL"
+        return tt
+    tt.real_n, tt.real_e, tt.real_r, tt.real_pitch, src_r = rt
+    tt.sitl_n, tt.sitl_e, tt.sitl_r, tt.sitl_pitch, src_s = st
+    tt.pos_src = src_r if src_r == src_s else f"{src_r} vs {src_s}"
+
+    # Trajectory difference (heading-invariant, since both start at the event point)
+    dr = tt.sitl_r - tt.real_r
+    tt.rms_horiz = float(np.sqrt(np.nanmean(dr * dr)))
+    dp = (tt.sitl_pitch - tt.real_pitch + 180.0) % 360.0 - 180.0
+    tt.rms_pitch = float(np.sqrt(np.nanmean(dp * dp)))
+
+    # Overshoot = peak position-controller tracking error over the window. This is
+    # the bounded XY excursion past the commanded stop point, NOT the cruise travel
+    # through the window, so the two logs are compared on the same physical quantity.
+    er, perr_r, psrc_r = pos_track_error_series(real)
+    es, perr_s, psrc_s = pos_track_error_series(sitl)
+    base_r = grid + (t_real - pre)
+    base_s = grid + (t_sitl - pre) + lag
+    if er is not None:
+        tt.real_perr = interp_at(er, perr_r, base_r)
+        tt.overshoot_real = float(np.nanmax(tt.real_perr))
+    if es is not None:
+        tt.sitl_perr = interp_at(es, perr_s, base_s)
+        tt.overshoot_sitl = float(np.nanmax(tt.sitl_perr))
+    if er is not None and es is not None:
+        tt.perr_src = psrc_r if psrc_r == psrc_s else f"{psrc_r} vs {psrc_s}"
+        tt.overshoot_ratio = (tt.overshoot_sitl / tt.overshoot_real
+                              if tt.overshoot_real else float("nan"))
+    elif tt.kind == "back":
+        tt.note = "no PSC tracking error (position controller not logged); overshoot from trajectory only"
+    tt.have = True
+    return tt
+
+
+def transition_tracks(real: LogData, sitl: LogData, pre: float, post: float,
+                      dt: float) -> dict:
+    """Forward- and back-transition ground-track/attitude comparison (real vs SITL)."""
+    pr, ps = detect_phases(real), detect_phases(sitl)
+    return {
+        "forward": _transition_track(real, sitl, "forward", pr.t_fw, ps.t_fw,
+                                     pre, post, dt),
+        "back": _transition_track(real, sitl, "back", pr.t_vtol, ps.t_vtol,
+                                  pre, post, dt),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 def make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
@@ -846,6 +1042,80 @@ def make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
     plt.close("all")
 
 
+def make_track_plots(tracks: dict, outdir, show, pre):
+    """Forward/back transition: XY ground track, horizontal excursion, pitch.
+
+    One column per transition; SITL is lag-aligned onto real. The back-transition
+    column is the post-stall-drag diagnostic -- a SITL excursion curve that runs
+    above real means SITL coasts further before settling (drag under-modelled).
+    """
+    import matplotlib.pyplot as plt
+
+    have = [k for k in ("forward", "back") if tracks[k].have]
+    if not have:
+        return
+    os.makedirs(outdir, exist_ok=True)
+    ncol = len(have)
+    fig, axes = plt.subplots(3, ncol, figsize=(6.5 * ncol, 12), squeeze=False)
+    for ci, key in enumerate(have):
+        tt = tracks[key]
+        g = tt.grid - pre  # time relative to the transition event
+        title = "Forward (hover->cruise)" if key == "forward" else "Back (cruise->hover)"
+
+        # row 0: XY ground track (East vs North), origin = position at the event
+        ax = axes[0][ci]
+        ax.plot(tt.real_e, tt.real_n, "-", color="C0", label="real")
+        ax.plot(tt.sitl_e, tt.sitl_n, "--", color="C1", label="SITL")
+        ax.plot(0, 0, "k*", ms=12, label="event point")
+        ax.set_xlabel("East (m)")
+        ax.set_ylabel("North (m)")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_title(f"{title}\nground track ({tt.pos_src})")
+        ax.grid(True)
+        ax.legend(fontsize=8)
+
+        # row 1: XY overshoot of the commanded stop point (PSC tracking error),
+        # falling back to the real-vs-SITL trajectory difference if PSC is absent
+        ax = axes[1][ci]
+        if tt.real_perr is not None or tt.sitl_perr is not None:
+            if tt.real_perr is not None:
+                ax.plot(g, tt.real_perr, "-", color="C0", label="real")
+            if tt.sitl_perr is not None:
+                ax.plot(g, tt.sitl_perr, "--", color="C1", label="SITL")
+            ax.set_ylabel("pos-ctrl tracking error |actual-target| (m)")
+            ax.set_title(f"XY overshoot  peak real={tt.overshoot_real:.1f} m  "
+                         f"SITL={tt.overshoot_sitl:.1f} m  (x{tt.overshoot_ratio:.2f})")
+        else:
+            ax.plot(g, np.abs(tt.sitl_r - tt.real_r), "-", color="C3",
+                    label="|SITL-real| track")
+            ax.set_ylabel("real-vs-SITL track diff (m)")
+            ax.set_title(f"trajectory difference  RMS={tt.rms_horiz:.1f} m  "
+                         "(no PSC log -> no target overshoot)")
+        ax.axvline(0.0, color="k", lw=0.8, ls=":")
+        ax.set_xlabel("time relative to event (s)")
+        ax.grid(True)
+        ax.legend(fontsize=8)
+
+        # row 2: pitch vs time (lag-aligned)
+        ax = axes[2][ci]
+        ax.plot(g, tt.real_pitch, "-", color="C0", label="real")
+        ax.plot(g, tt.sitl_pitch, "--", color="C1", label="SITL")
+        ax.axvline(0.0, color="k", lw=0.8, ls=":")
+        ax.set_xlabel("time relative to event (s)")
+        ax.set_ylabel("pitch (deg)")
+        ax.set_title(f"pitch  RMS dpitch={tt.rms_pitch:.1f} deg  "
+                     f"(SITL shifted {tt.lag_s:+.2f}s, xcorr {tt.xcorr_peak:.2f})")
+        ax.grid(True)
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Transition ground-track & attitude (SITL lag-aligned onto real)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "transition_tracks.png"), dpi=120)
+    if show:
+        plt.show()
+    plt.close("all")
+
+
 # ---------------------------------------------------------------------------
 # Report (metrics + tuning map)
 # ---------------------------------------------------------------------------
@@ -859,7 +1129,8 @@ def common_bins(a: CruiseSig, b: CruiseSig):
     return out
 
 
-def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir, elec_pred=None):
+def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
+                 elec_pred=None, tracks=None):
     lines = []
     P = lines.append
     P("=" * 70)
@@ -971,6 +1242,38 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir, elec_pr
         P(f"  skipped: {tm.note}")
     P("")
 
+    # ---- transition ground-track / attitude (overshoot) ----
+    overshoot_flag = None   # (kind, ratio) of a back-transition over-coast, for the tuning map
+    P("--- TRANSITION ground-track & attitude (real vs SITL, lag-aligned) ---")
+    if not tracks:
+        P("  skipped: no track comparison computed")
+    else:
+        any_done = False
+        for key, label in (("forward", "FORWARD (hover->cruise)"),
+                           ("back", "BACK (cruise->hover)")):
+            tt = tracks.get(key)
+            if tt is None or not tt.have:
+                P(f"  {label}: skipped ({tt.note if tt else 'n/a'})")
+                continue
+            any_done = True
+            P(f"  {label}   [pos {tt.pos_src}]")
+            if np.isfinite(tt.overshoot_real) or np.isfinite(tt.overshoot_sitl):
+                P(f"    XY overshoot (peak)  : real {tt.overshoot_real:6.1f} m   "
+                  f"SITL {tt.overshoot_sitl:6.1f} m   (SITL/real x{tt.overshoot_ratio:.2f})   "
+                  f"[{tt.perr_src}]")
+            else:
+                P("    XY overshoot (peak)  : n/a (no PSC position-controller log)")
+            P(f"    RMS real-vs-SITL track: {tt.rms_horiz:6.1f} m")
+            P(f"    RMS pitch diff       : {tt.rms_pitch:6.1f} deg   "
+              f"(SITL shifted {tt.lag_s:+.2f}s, pitch-rate xcorr {tt.xcorr_peak:.2f})")
+            if key == "back" and np.isfinite(tt.overshoot_ratio):
+                overshoot_flag = (key, tt.overshoot_ratio)
+        if any_done:
+            P("  (XY overshoot = peak position-controller error |actual-target|, i.e. how far")
+            P("   the vehicle sails past the commanded stop point. On the back transition a")
+            P("   SITL value above real means SITL coasts further -> post-stall drag too low.)")
+    P("")
+
     # ---- tuning map ----
     P("--- TUNING MAP: gap -> SDF coefficient (model-aero-VITERNA-m.sdf) ---")
     suggestions = []
@@ -1023,6 +1326,18 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir, elec_pr
                 suggestions.append(
                     f"SITL accelerates FASTER to target airspeed ({d:.1f} s): too little drag "
                     "-> raise CD0.")
+    if overshoot_flag is not None:
+        _, ratio = overshoot_flag
+        if ratio > 1.15:
+            suggestions.append(
+                f"SITL over-coasts the back transition (peak excursion x{ratio:.2f} vs real): "
+                "the aircraft pitches into deep stall to decelerate, so this is the post-stall "
+                "DRAG -> RAISE CDa_stall (and check alpha_stall earlier / CLa_stall) so SITL "
+                "sheds speed and stops at the hover point instead of overshooting in XY.")
+        elif ratio < 0.85:
+            suggestions.append(
+                f"SITL under-coasts the back transition (peak excursion x{ratio:.2f} vs real): "
+                "post-stall drag too high -> LOWER CDa_stall.")
     if not suggestions:
         suggestions.append("no gaps above threshold; aero model agrees with the data in scope.")
     for s in suggestions:
@@ -1148,6 +1463,11 @@ def main() -> None:
                     help="re-chop a .bin input even if its *_chopped dir already exists")
     ap.add_argument("--pre", type=float, default=10.0, help="transition window pre-event (s)")
     ap.add_argument("--post", type=float, default=3.0, help="transition window post-event (s)")
+    ap.add_argument("--track-pre", type=float, default=15.0,
+                    help="ground-track window before the transition event (s); wider than "
+                         "--pre to capture the whole deceleration into the 'done' event")
+    ap.add_argument("--track-post", type=float, default=5.0,
+                    help="ground-track window after the transition event (s)")
     ap.add_argument("--dt", type=float, default=0.02, help="resample dt for xcorr (s)")
     ap.add_argument("--no-show", action="store_true", help="save plots without displaying")
     args = ap.parse_args()
@@ -1183,6 +1503,16 @@ def main() -> None:
     print("computing transition dynamics...")
     tm = transition_metrics(real, sitl, args.pre, args.post, args.dt)
 
+    print("computing transition ground-tracks (forward & back)...")
+    tracks = transition_tracks(real, sitl, args.track_pre, args.track_post, args.dt)
+    for key in ("forward", "back"):
+        tt = tracks[key]
+        if tt.have:
+            print(f"  {key}: peak excursion real {tt.overshoot_real:.1f} m / "
+                  f"SITL {tt.overshoot_sitl:.1f} m (x{tt.overshoot_ratio:.2f})")
+        else:
+            print(f"  {key}: skipped ({tt.note})")
+
     # powertrain current/power prediction (defaults to config/motors + config/batteries)
     motor_xml = find_config(args.motor or "motor.xml", "motors")
     motor_xml = motor_xml if os.path.exists(motor_xml) else None
@@ -1204,7 +1534,9 @@ def main() -> None:
 
     make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
                args.outdir, not args.no_show, args.pre, args.post, args.dt, elec_pred)
-    write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, args.outdir, elec_pred)
+    make_track_plots(tracks, args.outdir, not args.no_show, args.track_pre)
+    write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, args.outdir,
+                 elec_pred, tracks)
 
 
 if __name__ == "__main__":
