@@ -17,15 +17,28 @@ The two flights are never assumed to share a clock:
                   the commanded stop point, and pitch, real vs SITL. The back
                   transition's overshoot is the post-stall-drag (CDa_stall) probe.
 
-Outputs (into --outdir): drag-signature plot, lift/trim plot (with the SDF-predicted
-curve overlaid), transition overlay plot, transition-tracks plot, and report.txt
-(metrics + tuning map).
+The MODEL UPDATE is fitted on the battery POWER channel (measured pack power
+inverted through the motor/prop/battery model to thrust, then
+CD = CD0 + CL^2/(pi*AR*eff) regressed over every level-cruise sample);
+thrust-from-RPM is kept only as a cross-check. Coefficients the flight cannot
+constrain are held at the Flow5 prior.
 
---real / --sitl accept EITHER a chop_log CSV directory OR a raw .bin log. A .bin is
-auto-chopped (full data: tier 3 + all sensors) into <outdir>/<logname>_chopped and
-reused on later runs (--rechop to force regeneration).
+Outputs (into --outdir): drag-signature plot, lift/trim plot, power/current
+plot, transition overlay + tracks plots, report.txt, metrics.json (every
+scalar, machine-readable) and a row in the run ledger CSV (score + coefficient
+history across runs, default <outdir>/../compare_runs.csv). --write-sdf also
+emits a copy of the SDF with the fitted revisions applied.
 
-Usage:
+--real / --sitl accept a chop_log CSV directory OR a raw .bin log (auto-chopped
+into <outdir>/<logname>_chopped, reused unless --rechop). --sitl also accepts
+'latest' / 'latest-N': the newest (N-back) SITL log via LASTLOG.TXT.
+Defaults for the recurring arguments come from config/compare.ini ([compare]
+section, CLI wins), so the routine run is just:
+
+    python compare_logs.py                 # real + latest SITL log, all defaults
+    python compare_logs.py --sitl latest-1 --write-sdf
+
+Fully explicit:
     python compare_logs.py \
         --real /home/alan/Ardu_Log/2026-5-22-16-07-32-2nd-aircraft-fw.bin \
         --sitl /home/alan/ardupilot/logs/00000103.BIN \
@@ -37,10 +50,14 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import configparser
 import csv
+import datetime
 import importlib.util
+import json
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -55,8 +72,9 @@ from sdf_aero_performance import (
     load_propeller_csv,
     load_sdf_model,
 )
-from motor_prop_performance import load_battery, load_motor
-from config_paths import find_config
+from hover_performance import solve_hover
+from motor_prop_performance import load_battery, load_motor, solve_operating_point
+from config_paths import find_config, CONFIG_DIR
 
 G = 9.80665
 
@@ -374,6 +392,31 @@ def interp_at(t_src, y_src, t_query):
     return np.interp(t_query, np.asarray(t_src)[order], np.asarray(y_src)[order])
 
 
+def battery_series(log: LogData):
+    """Propulsion-pack telemetry (rel_time, current A, volt V, source).
+
+    With multiple BAT instances the propulsion pack is taken as the instance
+    drawing the most current (avoids picking an avionics/secondary pack that
+    reads ~0 A). Returns four Nones when BAT.Curr/Volt is not logged.
+    """
+    if not log.has("BAT", "Curr", "Volt"):
+        return None, None, None, None
+    bt = log.rel("BAT")
+    curr, volt = log.col("BAT", "Curr"), log.col("BAT", "Volt")
+    src = "BAT"
+    if "Inst" in log.msgs["BAT"]:
+        inst = log.col("BAT", "Inst")
+        best, binst = -1.0, -1
+        for i in sorted(set(int(x) for x in inst)):
+            med = float(np.nanmedian(np.abs(curr[inst == i])))
+            if med > best:
+                best, binst = med, i
+        sel = inst == binst
+        bt, curr, volt = bt[sel], curr[sel], volt[sel]
+        src = f"BAT[{binst}]"
+    return bt, curr, volt, src
+
+
 # ---------------------------------------------------------------------------
 # Measured total thrust at cruise sample times, from ESC RPM (fallback RCOU PWM)
 # ---------------------------------------------------------------------------
@@ -447,11 +490,18 @@ class CruiseSig:
     current: np.ndarray = None      # pack current (A), per airspeed bin
     power: np.ndarray = None        # electrical pack power (W), per bin
     elec_src: str = "n/a"
+    # per-sample (unbinned) level-cruise arrays, for regression fits:
+    # keys t, v, thrust, aoa, pitch, current, power, volt (aligned, may hold NaN)
+    raw: dict = None
+
+
+_FIT_ROLL_MAX = 45.0   # deg; beyond this the coordinated-turn CL correction is shaky
 
 
 def cruise_signature(log: LogData, prop: PropTable, sdf_prop_info: dict,
                      v_lo: float, v_hi: float, v_step: float,
-                     max_climb: float) -> CruiseSig | None:
+                     max_climb: float, max_roll: float = 10.0,
+                     max_accel: float = 0.5) -> CruiseSig | None:
     ph = detect_phases(log)
     t_arsp, v_arsp, vsrc = airspeed_series(log)
     if t_arsp is None:
@@ -473,8 +523,33 @@ def cruise_signature(log: LogData, prop: PropTable, sdf_prop_info: dict,
         cr_q = interp_at(tcr, cr, t_arsp)
         mask &= np.abs(cr_q) <= max_climb
 
+    # quasi-steady filter: T = D only holds while V is steady, so drop
+    # acceleration transients (~1 s smoothed dV/dt)
+    if len(t_arsp) > 5:
+        dt_med = float(np.median(np.diff(t_arsp))) or 0.02
+        w = max(1, int(round(1.0 / dt_med)))
+        v_smooth = np.convolve(v_arsp, np.ones(w) / w, mode="same")
+        mask &= np.abs(np.gradient(v_smooth, t_arsp)) <= max_accel
+
+    # Banked turns: CL = n*W/(q*S) with n = 1/cos(roll) (coordinated, level).
+    # The binned signature keeps only wings-level samples (|roll|<=max_roll, so
+    # real and SITL bins are the same operating point); the regression keeps
+    # turning samples up to _FIT_ROLL_MAX and corrects CL by the load factor --
+    # a constant-V turn is a legitimate CL sweep.
+    roll_q = None
+    if log.has("ATT", "Roll"):
+        roll_q = interp_at(log.rel("ATT"), log.col("ATT", "Roll"), t_arsp)
+        mask &= np.abs(roll_q) <= _FIT_ROLL_MAX
+
     t_q = t_arsp[mask]
     v_q = v_arsp[mask]
+    if roll_q is not None:
+        roll_k = roll_q[mask]
+        load = 1.0 / np.cos(np.radians(np.clip(roll_k, -60.0, 60.0)))
+        level_sel = np.abs(roll_k) <= max_roll
+    else:
+        load = np.ones(len(t_q))
+        level_sel = np.ones(len(t_q), dtype=bool)
     if len(t_q) < 10:
         print(f"  [{log.name}] only {len(t_q)} cruise samples -> skip")
         return None
@@ -503,34 +578,23 @@ def cruise_signature(log: LogData, prop: PropTable, sdf_prop_info: dict,
         thr_pct = np.full(len(t_q), np.nan)
 
     # battery pack current (A) and electrical power (W = V*I)
-    elec_src = "n/a"
-    if log.has("BAT", "Curr", "Volt"):
-        bt = log.rel("BAT")
-        curr_raw, volt_raw = log.col("BAT", "Curr"), log.col("BAT", "Volt")
-        binst = -1
-        if "Inst" in log.msgs["BAT"]:
-            # propulsion pack = the battery instance drawing the most current
-            # (avoids picking an avionics/secondary pack that reads ~0 A)
-            inst = log.col("BAT", "Inst")
-            best = -1.0
-            for i in sorted(set(int(x) for x in inst)):
-                med = float(np.nanmedian(np.abs(curr_raw[inst == i])))
-                if med > best:
-                    best, binst = med, i
-            sel = inst == binst
-            bt, curr_raw, volt_raw = bt[sel], curr_raw[sel], volt_raw[sel]
+    bt, curr_raw, volt_raw, elec_src = battery_series(log)
+    if bt is not None:
         cur_q = interp_at(bt, curr_raw, t_q)
-        pow_q = cur_q * interp_at(bt, volt_raw, t_q)
-        elec_src = f"BAT[{binst}]" if binst >= 0 else "BAT"
+        volt_q = interp_at(bt, volt_raw, t_q)
+        pow_q = cur_q * volt_q
     else:
+        elec_src = "n/a"
         cur_q = np.full(len(t_q), np.nan)
+        volt_q = np.full(len(t_q), np.nan)
         pow_q = np.full(len(t_q), np.nan)
 
-    # bin by airspeed, take medians
+    # bin by airspeed, take medians (wings-level samples only, so the real and
+    # SITL bins describe the same operating point)
     edges = np.arange(v_lo, v_hi + v_step, v_step)
     centers, t_b, a_b, p_b, q_b, cu_b, pw_b = [], [], [], [], [], [], []
     for i in range(len(edges) - 1):
-        b = (v_q >= edges[i]) & (v_q < edges[i + 1])
+        b = level_sel & (v_q >= edges[i]) & (v_q < edges[i + 1])
         if b.sum() < 3:
             continue
         centers.append(0.5 * (edges[i] + edges[i + 1]))
@@ -544,12 +608,99 @@ def cruise_signature(log: LogData, prop: PropTable, sdf_prop_info: dict,
         print(f"  [{log.name}] no populated airspeed bins -> skip")
         return None
 
-    print(f"  [{log.name}] cruise: {len(t_q)} samples, {len(centers)} bins "
+    print(f"  [{log.name}] cruise: {int(level_sel.sum())} level + "
+          f"{int((~level_sel).sum())} banked samples, {len(centers)} bins "
           f"(airspeed {vsrc}, thrust {thr_src}, elec {elec_src})")
+    raw = {"t": t_q, "v": v_q, "load": load,
+           "thrust": thr if thr is not None else np.full(len(t_q), np.nan),
+           "aoa": aoa_q, "pitch": pitch_q,
+           "current": cur_q, "power": pow_q, "volt": volt_q}
     return CruiseSig(np.array(centers), np.array(t_b), np.array(a_b),
                      np.array(p_b), np.array(q_b), thr_src, aoa_src,
                      len(t_q), note, current=np.array(cu_b),
-                     power=np.array(pw_b), elec_src=elec_src)
+                     power=np.array(pw_b), elec_src=elec_src, raw=raw)
+
+
+# ---------------------------------------------------------------------------
+# Hover electrical signature: median battery draw while hovering (V ~ 0)
+# ---------------------------------------------------------------------------
+@dataclass
+class HoverSig:
+    current: float        # median pack current (A)
+    power: float          # median electrical power (W = V*I)
+    volt: float           # median pack voltage (V)
+    n_samples: int
+    elec_src: str
+    note: str = ""
+
+
+def hover_signature(log: LogData, max_climb: float, v_hover_max: float = 4.0,
+                    settle: float = 3.0, min_alt: float = 2.0) -> HoverSig | None:
+    """Median battery draw in hover: in-air, near-zero airspeed, level.
+
+    Hover windows come from the log's own transition events: everything
+    before 'Transition FW done' (takeoff hover) plus everything after
+    'Transition VTOL done' (landing hover), each trimmed by `settle` seconds.
+    In-air is gated on altitude above the first position sample; without a
+    position log it falls back to current above 25% of the window peak
+    (drops disarmed/ground-idle samples that would drag the median down).
+    """
+    bt, curr, volt, src = battery_series(log)
+    if bt is None:
+        print(f"  [{log.name}] no BAT.Curr/Volt -> skip hover signature")
+        return None
+    ph = detect_phases(log)
+    mask = np.zeros(len(bt), bool)
+    note = ""
+    if ph.t_fw is not None:
+        mask |= bt <= ph.t_fw - settle
+    if ph.t_vtol is not None:
+        mask |= bt >= ph.t_vtol + settle
+    if ph.t_fw is None and ph.t_vtol is None:
+        mask[:] = True
+        note = "no transition events; hover = low-airspeed samples of whole log"
+
+    t_a, v_a, _ = airspeed_series(log)
+    if t_a is not None:
+        mask &= interp_at(t_a, v_a, bt) <= v_hover_max
+    tcr, cr = climbrate_series(log)
+    if tcr is not None:
+        mask &= np.abs(interp_at(tcr, cr, bt)) <= max_climb
+
+    t_pos, _, _, down, _ = position_ned_series(log)
+    if t_pos is not None:
+        alt = -(interp_at(t_pos, down, bt) - float(down[0]))
+        mask &= alt >= min_alt
+    elif mask.any():
+        mask &= curr >= 0.25 * float(np.nanmax(curr[mask]))
+        note = (note + "; " if note else "") + "no position log; in-air gated on current"
+
+    if mask.sum() < 5:
+        print(f"  [{log.name}] only {int(mask.sum())} hover samples -> skip hover signature")
+        return None
+    cur_med = float(np.nanmedian(curr[mask]))
+    pow_med = float(np.nanmedian(curr[mask] * volt[mask]))
+    print(f"  [{log.name}] hover: {int(mask.sum())} samples, "
+          f"{cur_med:.1f} A / {pow_med:.0f} W ({src})")
+    return HoverSig(current=cur_med, power=pow_med,
+                    volt=float(np.nanmedian(volt[mask])),
+                    n_samples=int(mask.sum()), elec_src=src, note=note)
+
+
+def predicted_hover(prop_csv: str, motor_xml: str, battery_xml: str,
+                    n_motors: int, mass: float):
+    """Model hover point (pack current A, power W, throttle 0..1) from solve_hover.
+
+    Same powertrain solve as sdf_aero_performance.py's hover block; None when
+    inputs are missing or full-throttle static thrust < weight.
+    """
+    if not (motor_xml and battery_xml):
+        return None
+    h = solve_hover(load_motor(motor_xml), load_propeller_csv(prop_csv),
+                    load_battery(battery_xml), mass, n_motors=n_motors)
+    if h is None:
+        return None
+    return h.current_per_motor_A * n_motors, h.P_elec_total_W, h.throttle
 
 
 @dataclass
@@ -560,6 +711,7 @@ class Revision:
     kind: str             # 'identified' | 'combination' | 'held'
     note: str
     sigma: float = float("nan")
+    channel: str = ""     # measurement the number rests on
 
 
 # Identifiability thresholds: what variation the data must show to separate
@@ -568,77 +720,253 @@ class Revision:
 # hold its partner at the Flow5 prior.
 _CL_SPREAD_MIN = 0.25     # (CLmax-CLmin)/CLmean to split CD0 from induced (eff)
 _AOA_SPAN_MIN = 3.0       # deg of AoA range to split CL0 from CLa
-_MIN_BINS = 3
+_MIN_FIT_SAMPLES = 20     # per-sample regression minimum
 
 
-def recommend_revisions(real_sig: "CruiseSig | None", aero: AeroModel, mass: float):
-    """Identifiability-aware model update.
+class PowerInverter:
+    """Powertrain model inverted: (V, P_elec per motor) -> thrust per motor (N).
 
-    Returns (revisions, diag). Each Revision is tagged 'identified' (the data
-    span resolves it), 'combination' (only a coupled sum is known -> offset put
-    on the leading term, partner held), or 'held' (not excited -> keep Flow5
-    prior). This replaces blind single-term fits: a coefficient is only changed
-    when the flight actually constrains it.
+    solve_operating_point is tabulated once over a (V, throttle) grid; lookups
+    then interpolate measured electrical power onto thrust along the throttle
+    axis at the two bracketing airspeeds. Power outside the tabulated envelope
+    (below idle / above full throttle) returns NaN rather than extrapolating.
+    """
+
+    def __init__(self, motor, prop, battery, v_lo: float, v_hi: float,
+                 soc: float = 1.0, nv: int = 21, nthr: int = 33):
+        self.soc = soc
+        self.Vs = np.linspace(max(v_lo, 0.5), max(v_hi, v_lo + 1.0), nv)
+        self.tabs = []
+        for V in self.Vs:
+            P, T = [], []
+            for thr in np.linspace(0.02, 1.0, nthr):
+                op = solve_operating_point(motor, prop, battery, float(thr),
+                                           float(V), soc=soc)
+                if op is None:
+                    continue
+                P.append(op.P_elec_W)
+                T.append(op.thrust_N)
+            if len(P) >= 2:
+                P, T = np.array(P), np.array(T)
+                order = np.argsort(P)
+                self.tabs.append((P[order], T[order]))
+            else:
+                self.tabs.append(None)
+
+    def _row(self, i: int, P: float) -> float:
+        tab = self.tabs[i]
+        if tab is None or P < tab[0][0] or P > tab[0][-1]:
+            return float("nan")
+        return float(np.interp(P, tab[0], tab[1]))
+
+    def thrust_at(self, V: float, P_per_motor: float) -> float:
+        if V <= self.Vs[0]:
+            return self._row(0, P_per_motor)
+        if V >= self.Vs[-1]:
+            return self._row(len(self.Vs) - 1, P_per_motor)
+        hi = int(np.searchsorted(self.Vs, V))
+        lo = hi - 1
+        f = (V - self.Vs[lo]) / (self.Vs[hi] - self.Vs[lo])
+        t_lo, t_hi = self._row(lo, P_per_motor), self._row(hi, P_per_motor)
+        return t_lo + f * (t_hi - t_lo)
+
+
+def _soc_from_volt(battery, volt_med: float, current_med: float,
+                   n_motors: int) -> float:
+    """Model SoC whose open-circuit voltage matches the flight's measured pack
+    voltage (terminal volt + per-motor current * R_internal sag)."""
+    if not (np.isfinite(volt_med) and np.isfinite(current_med)):
+        return 1.0
+    v_oc = volt_med + (current_med / max(n_motors, 1)) * battery.R_internal
+    rng = battery.V_full - battery.V_empty
+    if rng <= 0:
+        return 1.0
+    return min(1.0, max(0.05, (v_oc - battery.V_empty) / rng))
+
+
+def _ols_line(x: np.ndarray, y: np.ndarray):
+    """Least-squares y = b0 + b1*x -> (b0, b1, sigma_b0, sigma_b1)."""
+    n = len(x)
+    A = np.column_stack([np.ones(n), x])
+    coef, _, rank, _ = np.linalg.lstsq(A, y, rcond=None)
+    b0, b1 = float(coef[0]), float(coef[1])
+    dof = n - 2
+    if dof <= 0 or rank < 2:
+        return b0, b1, float("nan"), float("nan")
+    r = y - A @ coef
+    s2 = float(r @ r) / dof
+    cov = s2 * np.linalg.inv(A.T @ A)
+    return b0, b1, math.sqrt(cov[0, 0]), math.sqrt(cov[1, 1])
+
+
+def recommend_revisions(real_sig: "CruiseSig | None", aero: AeroModel,
+                        mass: float, powertrain: dict | None = None,
+                        fit_dt: float = 0.5, v_step: float = 2.0):
+    """Identifiability-aware model update, fitted on the per-sample time series.
+
+    Drag is estimated on the BATTERY POWER channel when a powertrain model
+    (dict with motor/prop/battery/n_motors) is supplied: measured pack power is
+    inverted through the powertrain to thrust, hence CD, and
+    CD = CD0 + CL^2/(pi*AR*eff) is regressed over all level-cruise samples.
+    Thrust-from-RPM serves only as a cross-check (single ESC instance + RPM
+    spikes make it the noisy channel); it becomes the primary only when no
+    powertrain model or battery telemetry exists.
+
+    Samples are decimated to ~1/fit_dt Hz so the OLS sigmas aren't shrunk by
+    serial correlation. Revisions are tagged 'identified' (the data span
+    resolves the term), 'combination' (only a coupled sum is constrained ->
+    offset on the leading term, partner held) or 'held' (keep Flow5 prior).
     """
     revs: list[Revision] = []
-    diag = {"n_bins": 0, "eff_identifiable": False, "cla_identifiable": False}
-    if real_sig is None:
+    diag = {"n_fit": 0, "eff_identifiable": False, "cla_identifiable": False,
+            "drag_channel": None}
+    if real_sig is None or real_sig.raw is None or len(real_sig.raw["t"]) < 2:
         return revs, diag
-    W, S, rho = mass * G, aero.area, aero.rho
+    raw = real_sig.raw
+    t = raw["t"]
+    step = max(1, int(round(fit_dt / max(float(np.median(np.diff(t))), 1e-3))))
+    sl = slice(None, None, step)
+    v = raw["v"][sl]
+    power, volt, current = raw["power"][sl], raw["volt"][sl], raw["current"][sl]
+    aoa, thrust_rpm = raw["aoa"][sl], raw["thrust"][sl]
+    load = raw.get("load")
+    load = load[sl] if load is not None else np.ones(len(v))
 
-    CLs, dCDs, aoas, apreds, vs = [], [], [], [], []
-    for v, T, aoa in zip(real_sig.v, real_sig.thrust, real_sig.aoa):
-        if v <= 0:
-            continue
-        q = 0.5 * rho * v * v
-        CL = W / (q * S)
-        a = alpha_trim(aero, CL)
-        if math.isnan(a):
-            continue
-        CLs.append(CL)
-        vs.append(v)
-        if np.isfinite(T):
-            dCDs.append(T / (q * S) - float(CD_of_alpha(aero, np.array([a]))[0]))
-        if real_sig.aoa_src.startswith("AOA") and np.isfinite(aoa):
-            aoas.append(aoa)
-            apreds.append(math.degrees(a))
-    if not CLs:
-        return revs, diag
+    W, S = mass * G, aero.area
+    ok_v = v > 1.0
+    q = 0.5 * aero.rho * v * v
+    # lift = n*W in a coordinated level turn (n from roll) -- banked samples
+    # are kept on purpose: a constant-V turn sweeps CL, which is what separates
+    # induced from parasitic drag
+    CL = np.where(ok_v, load * W / np.where(ok_v, q * S, 1.0), np.nan)
+    x_ind = CL * CL / (math.pi * aero.AR)          # CD = CD0 + x_ind/eff
 
-    CLlo, CLhi, CLmean = min(CLs), max(CLs), float(np.mean(CLs))
-    cl_spread = (CLhi - CLlo) / CLmean if CLmean else 0.0
-    diag.update(n_bins=len(CLs), V=(min(vs), max(vs)), CL=(CLlo, CLhi),
-                cl_spread=cl_spread, aoa=(min(aoas), max(aoas)) if aoas else None)
+    base = ok_v & np.isfinite(CL)
+    if base.any():
+        CLb = CL[base]
+        diag["V"] = (float(v[base].min()), float(v[base].max()))
+        diag["CL"] = (float(CLb.min()), float(CLb.max()))
+        diag["cl_spread"] = (float((CLb.max() - CLb.min()) / CLb.mean())
+                             if CLb.mean() else 0.0)
 
-    # --- drag: CD0 vs induced (eff) ---
-    if dCDs:
-        dCD0 = float(np.mean(dCDs))
-        sig = float(np.std(dCDs)) if len(dCDs) > 1 else float("nan")
-        if cl_spread >= _CL_SPREAD_MIN and len(dCDs) >= _MIN_BINS:
-            diag["eff_identifiable"] = True
-            revs.append(Revision("CD0", aero.CD0, aero.CD0 + dCD0, "identified",
-                                 f"CL spans {CLlo:.2f}-{CLhi:.2f} -> parasitic separable; "
-                                 f"mean dCD={dCD0:+.4f}", sig))
+    # ---- per-sample thrust on the power channel (primary) ----
+    T_pow = np.full(len(v), np.nan)
+    n_mot = int(powertrain["n_motors"]) if powertrain else 0
+    if powertrain is not None and np.isfinite(power).sum() >= _MIN_FIT_SAMPLES:
+        soc = _soc_from_volt(powertrain["battery"], float(np.nanmedian(volt)),
+                             float(np.nanmedian(current)), n_mot)
+        vf = v[base] if base.any() else v
+        inv = PowerInverter(powertrain["motor"], powertrain["prop"],
+                            powertrain["battery"], float(np.nanmin(vf)),
+                            float(np.nanmax(vf)), soc=soc)
+        for i in range(len(v)):
+            if ok_v[i] and np.isfinite(power[i]):
+                T_pow[i] = inv.thrust_at(float(v[i]), float(power[i]) / n_mot)
+        T_pow *= n_mot
+        diag["soc"] = soc
+        # binned power-derived thrust curve for the drag-signature plot
+        edges = np.arange(math.floor(np.nanmin(vf)),
+                          math.ceil(np.nanmax(vf)) + v_step, v_step)
+        pc_v, pc_t = [], []
+        for k in range(len(edges) - 1):
+            b = (v >= edges[k]) & (v < edges[k + 1]) & np.isfinite(T_pow)
+            if b.sum() >= 3:
+                pc_v.append(0.5 * (edges[k] + edges[k + 1]))
+                pc_t.append(float(np.nanmedian(T_pow[b])))
+        if pc_v:
+            diag["power_thrust_curve"] = (np.array(pc_v), np.array(pc_t))
+
+    def drag_fit(T_tot: np.ndarray, channel: str):
+        """Fit CD(CL^2) on one thrust channel -> (revisions, mean dCD, n)."""
+        sel = np.isfinite(T_tot) & base
+        n = int(sel.sum())
+        if n < _MIN_FIT_SAMPLES:
+            return [], float("nan"), n
+        CD_meas = T_tot[sel] / (q[sel] * S)
+        x, CLs = x_ind[sel], CL[sel]
+        dCD_mean = float(np.mean(CD_meas - (aero.CD0 + x / aero.eff)))
+        spread = float((CLs.max() - CLs.min()) / CLs.mean()) if CLs.mean() else 0.0
+        out = []
+        b1 = float("nan")
+        if spread >= _CL_SPREAD_MIN:
+            b0, b1, s0, s1 = _ols_line(x, CD_meas)
+        # joint fit only when it lands on physical values; a wild eff usually
+        # means the high-CL samples aren't really steady level flight
+        plausible = (np.isfinite(b1) and b1 > 0 and b0 > 0
+                     and 0.1 <= 1.0 / b1 <= 2.0)
+        if plausible:
+            out.append(Revision("CD0", aero.CD0, b0, "identified",
+                                f"CL spans {CLs.min():.2f}-{CLs.max():.2f} "
+                                f"({spread:.0%} spread, {n} samples) -> parasitic "
+                                "and induced separable", s0, channel))
+            out.append(Revision("eff", aero.eff, 1.0 / b1, "identified",
+                                "induced slope 1/(pi*AR*eff), fit jointly with CD0",
+                                s1 / (b1 * b1), channel))
         else:
-            revs.append(Revision("CD0", aero.CD0, aero.CD0 + dCD0, "combination",
-                                 f"single CL~{CLmean:.2f}: induced fixed, whole dCD={dCD0:+.4f} "
-                                 "folded into CD0", sig))
+            if spread < _CL_SPREAD_MIN:
+                reason = f"CL spread {spread:.0%} < {_CL_SPREAD_MIN:.0%}"
+            else:
+                reason = (f"joint CD0/eff fit unphysical (CD0={b0:.4f}, "
+                          f"eff={1.0 / b1 if b1 else float('nan'):.2f})")
+            resid = CD_meas - (aero.CD0 + x / aero.eff)
+            out.append(Revision("CD0", aero.CD0, aero.CD0 + float(np.mean(resid)),
+                                "combination",
+                                f"{reason}: induced held at eff={aero.eff}, whole "
+                                f"dCD={float(np.mean(resid)):+.4f} folded into CD0 "
+                                f"({n} samples)",
+                                float(np.std(resid) / math.sqrt(n)), channel))
+        return out, dCD_mean, n
 
-    # --- lift: CL0 vs CLa ---
-    if aoas:
-        da = [math.radians(p - o) for p, o in zip(apreds, aoas)]
-        mean_da = float(np.mean(da))
-        dCL0 = aero.CLa * mean_da
-        a_span = max(aoas) - min(aoas)
-        if a_span >= _AOA_SPAN_MIN and len(aoas) >= _MIN_BINS:
-            diag["cla_identifiable"] = True
-            revs.append(Revision("CL0", aero.CL0, aero.CL0 + dCL0, "identified",
-                                 f"AoA spans {a_span:.1f} deg -> CL0 separable; "
-                                 f"mean da={math.degrees(mean_da):+.2f} deg", float("nan")))
-        else:
-            revs.append(Revision("CL0", aero.CL0, aero.CL0 + dCL0, "combination",
-                                 f"single AoA~{np.mean(aoas):.1f} deg: fixes CL0+CLa*a, "
-                                 "folded into CL0", float("nan")))
+    pow_revs, dCD_pow, n_pow = drag_fit(T_pow, "battery power")
+    rpm_revs, dCD_rpm, n_rpm = drag_fit(thrust_rpm,
+                                        f"thrust-from-RPM ({real_sig.thrust_src})")
+    diag["dCD0_power"], diag["dCD0_rpm"] = dCD_pow, dCD_rpm
+    if pow_revs:
+        revs += pow_revs
+        diag["drag_channel"] = "battery power"
+        diag["n_fit"] = n_pow
+    elif rpm_revs:
+        revs += rpm_revs
+        diag["drag_channel"] = "thrust-from-RPM (no power data/model -> fallback)"
+        diag["n_fit"] = n_rpm
+    diag["eff_identifiable"] = any(r.tag == "eff" and r.kind == "identified"
+                                   for r in revs)
+
+    # ---- lift: CL = CL0 + CLa*alpha on real AoA-sensor samples ----
+    if real_sig.aoa_src.startswith("AOA"):
+        sel = np.isfinite(aoa) & base
+        n = int(sel.sum())
+        if n >= _MIN_FIT_SAMPLES:
+            a_rad = np.radians(aoa[sel])
+            span = float(np.degrees(a_rad.max() - a_rad.min()))
+            diag["aoa"] = (float(aoa[sel].min()), float(aoa[sel].max()))
+            b1 = float("nan")
+            if span >= _AOA_SPAN_MIN:
+                b0, b1, s0, s1 = _ols_line(a_rad, CL[sel])
+            # a fitted lift slope far off any plausible wing value means the
+            # AoA estimate and the load-corrected CL don't co-vary as physics
+            # demands (EKF-derived AoA is noisy, esp. in turns) -> combination
+            if np.isfinite(b1) and 1.5 <= b1 <= 7.0:
+                diag["cla_identifiable"] = True
+                revs.append(Revision("CL0", aero.CL0, b0, "identified",
+                                     f"AoA spans {span:.1f} deg ({n} samples) -> "
+                                     "CL0/CLa separable", s0, "AOA + level CL"))
+                revs.append(Revision("CLa", aero.CLa, b1, "identified",
+                                     "lift slope per rad, fit jointly with CL0",
+                                     s1, "AOA + level CL"))
+            else:
+                if span < _AOA_SPAN_MIN:
+                    reason = f"AoA span {span:.1f} deg < {_AOA_SPAN_MIN} deg"
+                else:
+                    reason = (f"joint CL0/CLa fit unphysical "
+                              f"(CLa_fit={b1:.2f}/rad outside 1.5-7)")
+                resid = CL[sel] - (aero.CL0 + aero.CLa * a_rad)
+                revs.append(Revision("CL0", aero.CL0,
+                                     aero.CL0 + float(np.mean(resid)), "combination",
+                                     f"{reason}: fixes only CL0+CLa*a, offset "
+                                     f"folded into CL0 ({n} samples)",
+                                     float(np.std(resid) / math.sqrt(n)),
+                                     "AOA + level CL"))
     return revs, diag
 
 
@@ -920,7 +1248,9 @@ def transition_tracks(real: LogData, sitl: LogData, pre: float, post: float,
 # Plotting
 # ---------------------------------------------------------------------------
 def make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
-               outdir, show, pre, post, dt, elec_pred=None):
+               outdir, show, pre, post, dt, elec_pred=None,
+               hover_real=None, hover_sitl=None, hover_pred=None,
+               pow_curve=None):
     import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
@@ -929,6 +1259,11 @@ def make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
     fig, ax = plt.subplots(figsize=(8, 6))
     if real_sig is not None and np.isfinite(real_sig.thrust).any():
         ax.plot(real_sig.v, real_sig.thrust, "o-", color="C0", label=f"real ({real_sig.thrust_src})")
+    if pow_curve is not None:
+        # the trusted drag channel: measured pack power inverted through the
+        # powertrain model (what the MODEL UPDATE fit actually uses)
+        ax.plot(pow_curve[0], pow_curve[1], "^-", color="C2",
+                label="real (from BAT power, inverted powertrain)")
     if sitl_sig is not None and np.isfinite(sitl_sig.thrust).any():
         ax.plot(sitl_sig.v, sitl_sig.thrust, "s-", color="C1", label=f"SITL ({sitl_sig.thrust_src})")
     vmax = max([s.v.max() for s in (real_sig, sitl_sig) if s is not None] + [20.0])
@@ -978,6 +1313,19 @@ def make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
         Vp, curp, pwp = elec_pred
         axc.plot(Vp, curp, "k--", label="powertrain model")
         axp.plot(Vp, pwp, "k--", label="powertrain model")
+    # hover points at V = 0 (median draw in the hover phases)
+    for hov, c, mk, tag in ((hover_real, "C0", "o", "real hover"),
+                            (hover_sitl, "C1", "s", "SITL hover")):
+        if hov is None:
+            continue
+        axc.plot(0.0, hov.current, mk, color=c, mfc="none", ms=10,
+                 label=f"{tag} ({hov.elec_src})")
+        axp.plot(0.0, hov.power, mk, color=c, mfc="none", ms=10,
+                 label=f"{tag} ({hov.elec_src})")
+    if hover_pred is not None:
+        Ih, Ph, th = hover_pred
+        axc.plot(0.0, Ih, "k*", ms=12, label=f"model hover (thr {th * 100:.0f}%)")
+        axp.plot(0.0, Ph, "k*", ms=12, label=f"model hover (thr {th * 100:.0f}%)")
     axc.set_xlabel("airspeed (m/s)")
     axc.set_ylabel("pack current (A)")
     axc.set_title("Current vs airspeed")
@@ -1130,7 +1478,12 @@ def common_bins(a: CruiseSig, b: CruiseSig):
 
 
 def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
-                 elec_pred=None, tracks=None):
+                 elec_pred=None, tracks=None,
+                 hover_real=None, hover_sitl=None, hover_pred=None,
+                 revs=None, diag=None):
+    """Write report.txt and return the metrics dict (also saved as metrics.json
+    by the caller). revs/diag come from recommend_revisions()."""
+    revs, diag = revs or [], diag or {}
     lines = []
     P = lines.append
     P("=" * 70)
@@ -1151,7 +1504,11 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
         if sitl_sig.note:
             P(f"  note (SITL): {sitl_sig.note}")
         if not pairs:
-            P("  no overlapping airspeed bins between the two logs.")
+            P("  no overlapping airspeed bins between the two logs:")
+            P(f"    real bins at {np.array2string(real_sig.v, precision=0)} m/s, "
+              f"SITL at {np.array2string(sitl_sig.v, precision=0)} m/s")
+            P("    -> SITL trims/cruises at a different airspeed than the real "
+              "aircraft; fix that first (TRIM_ARSPD_CM / drag level).")
         else:
             P(f"  {'V (m/s)':>8} {'dThrust(N)':>11} {'dThrottle%':>11} "
               f"{'dAoA(deg)':>10} {'dPitch(deg)':>11}")
@@ -1184,7 +1541,8 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
     P("")
 
     # ---- electrical: current & power ----
-    cur_bias = pow_bias = float("nan")
+    cur_bias = pow_bias = pow_bias_rel = float("nan")
+    elec_ref = None
     P("--- ELECTRICAL: current & power vs airspeed (cruise) ---")
     has_re = (real_sig is not None and real_sig.current is not None
               and np.isfinite(real_sig.current).any())
@@ -1197,7 +1555,7 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
     elif not has_se and elec_pred is None:
         P("  no SITL battery telemetry and no --motor/--battery model -> skipped")
     else:
-        ref = "SITL" if has_se else "model"
+        ref = elec_ref = "SITL" if has_se else "model"
         P(f"  {'V(m/s)':>7} {'I_real(A)':>10} {f'I_{ref}(A)':>10} "
           f"{'P_real(W)':>10} {f'P_{ref}(W)':>10}")
         dI, dP = [], []
@@ -1214,9 +1572,12 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
             dI.append(Ic - real_sig.current[i])
             dP.append(Pc - real_sig.power[i])
         cur_bias, pow_bias = float(np.nanmean(dI)), float(np.nanmean(dP))
+        p_real_mean = float(np.nanmean(real_sig.power))
+        pow_bias_rel = pow_bias / p_real_mean if p_real_mean else float("nan")
         P("")
         P(f"  mean current bias : {cur_bias:+.2f} A   ({ref} - real)")
-        P(f"  mean power bias   : {pow_bias:+.1f} W   ({ref} - real)")
+        P(f"  mean power bias   : {pow_bias:+.1f} W   ({ref} - real, "
+          f"{pow_bias_rel:+.1%} of real)")
         if np.isfinite(pow_bias):
             if pow_bias < 0:
                 P("  -> model/SITL draws LESS than real: real has more drag (see CD0) "
@@ -1226,6 +1587,36 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
                   "or the powertrain efficiency is pessimistic.")
         P("  NOTE: current/power reflect drag AND the motor/prop/battery model together,"
           " not the aero alone.")
+    P("")
+
+    # ---- electrical: hover ----
+    P("--- ELECTRICAL: hover current draw (V ~ 0, median over hover phases) ---")
+    if hover_real is None and hover_sitl is None and hover_pred is None:
+        P("  no hover data in either log and no powertrain model -> skipped")
+    else:
+        rows = []
+        for tag, hov in (("real", hover_real), ("SITL", hover_sitl)):
+            if hov is None:
+                P(f"  {tag:5s}: n/a (no usable hover samples)")
+            else:
+                rows.append((tag, hov.current, hov.power))
+                P(f"  {tag:5s}: {hov.current:6.1f} A  {hov.power:7.0f} W  "
+                  f"({hov.elec_src}, {hov.n_samples} samples"
+                  f"{', ' + hov.note if hov.note else ''})")
+        if hover_pred is not None:
+            Ih, Ph, th = hover_pred
+            rows.append(("model", Ih, Ph))
+            P(f"  model: {Ih:6.1f} A  {Ph:7.0f} W  (solve_hover, throttle {th * 100:.0f}%)")
+        if hover_real is not None:
+            for tag, I, Pw in rows:
+                if tag == "real":
+                    continue
+                dI = I - hover_real.current
+                rel = dI / hover_real.current if hover_real.current else float("nan")
+                P(f"  {tag} - real: {dI:+.1f} A ({rel:+.0%}), "
+                  f"{Pw - hover_real.power:+.0f} W")
+            P("  NOTE: hover draw probes static prop thrust + motor model + mass only;"
+              " the wing aero plays no part at V=0.")
     P("")
 
     P("--- TRANSITION dynamics (time-mismatch robust) ---")
@@ -1274,122 +1665,52 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
             P("   SITL value above real means SITL coasts further -> post-stall drag too low.)")
     P("")
 
-    # ---- tuning map ----
-    P("--- TUNING MAP: gap -> SDF coefficient (model-aero-VITERNA-m.sdf) ---")
-    suggestions = []
-    if np.isfinite(thrust_bias):
-        if thrust_bias > 0.3:
-            suggestions.append(
-                f"SITL needs MORE thrust than real (+{thrust_bias:.2f} N): SITL drag too high "
-                "-> LOWER CD0 (parasitic); if gap grows with V^2 it's CD0, if worst at low "
-                "V/high CL raise eff (induced).")
-        elif thrust_bias < -0.3:
-            suggestions.append(
-                f"SITL needs LESS thrust than real ({thrust_bias:.2f} N): SITL drag too low "
-                "-> RAISE CD0 / lower eff.")
-    if np.isfinite(thrust_slope_ratio) and abs(thrust_slope_ratio - 1) > 0.15:
-        suggestions.append(
-            f"thrust-vs-V slope ratio {thrust_slope_ratio:.2f}!=1: parasitic-drag scaling off "
-            "-> adjust CD0 (dominates the V^2 growth).")
-    if np.isfinite(aoa_bias) and abs(aoa_bias) > 1.0:
-        if aoa_bias > 0:
-            suggestions.append(
-                f"SITL trims at HIGHER AoA (+{aoa_bias:.2f} deg) for same V: SITL lift too low "
-                "-> RAISE CL0 / CLa.")
-        else:
-            suggestions.append(
-                f"SITL trims at LOWER AoA ({aoa_bias:.2f} deg): SITL lift too high "
-                "-> LOWER CL0 / CLa.")
-    if np.isfinite(pitch_bias) and abs(pitch_bias) > 1.0 and (
-            not np.isfinite(aoa_bias) or abs(pitch_bias - aoa_bias) > 1.0):
-        suggestions.append(
-            f"near-constant pitch offset ({pitch_bias:+.2f} deg) not explained by AoA: "
-            "zero-AoA pitching moment / CG -> adjust Cem0 (and CG vs <cp>).")
-    if tm.have:
-        if np.isfinite(tm.xcorr_peak) and tm.xcorr_peak < 0.6:
-            suggestions.append(
-                f"low pitch-rate xcorr ({tm.xcorr_peak:.2f}): transition pitch dynamics differ "
-                "-> check post-stall block (alpha_stall, CLa_stall, CDa_stall) and Cema.")
-        if np.isfinite(tm.rms_pitch) and tm.rms_pitch > 5.0:
-            suggestions.append(
-                f"high RMS pitch error ({tm.rms_pitch:.1f} deg) in transition "
-                "-> high-AoA longitudinal aero (Viterna post-stall: alpha_stall, CLa_stall, "
-                "CDa_stall) and pitch-damping suspect.")
-        if (np.isfinite(tm.t2v_real) and np.isfinite(tm.t2v_sitl)
-                and abs(tm.t2v_sitl - tm.t2v_real) > 1.0):
-            d = tm.t2v_sitl - tm.t2v_real
-            if d > 0:
-                suggestions.append(
-                    f"SITL accelerates SLOWER to target airspeed (+{d:.1f} s): excess drag or "
-                    "weak thrust -> lower CD0 / check prop CSV & mass (SDF mass vs real).")
-            else:
-                suggestions.append(
-                    f"SITL accelerates FASTER to target airspeed ({d:.1f} s): too little drag "
-                    "-> raise CD0.")
-    if overshoot_flag is not None:
-        _, ratio = overshoot_flag
-        if ratio > 1.15:
-            suggestions.append(
-                f"SITL over-coasts the back transition (peak excursion x{ratio:.2f} vs real): "
-                "the aircraft pitches into deep stall to decelerate, so this is the post-stall "
-                "DRAG -> RAISE CDa_stall (and check alpha_stall earlier / CLa_stall) so SITL "
-                "sheds speed and stops at the hover point instead of overshooting in XY.")
-        elif ratio < 0.85:
-            suggestions.append(
-                f"SITL under-coasts the back transition (peak excursion x{ratio:.2f} vs real): "
-                "post-stall drag too high -> LOWER CDa_stall.")
-    if not suggestions:
-        suggestions.append("no gaps above threshold; aero model agrees with the data in scope.")
-    for s in suggestions:
-        P(f"  * {s}")
-    P("")
-
-    # ---- identifiability-aware model update ----
-    P("--- MODEL UPDATE (identifiability-aware) ---")
-    P(f"  basis: level cruise, lift=weight, mass={mass:.2f} kg (override with --mass)")
-    revs, diag = recommend_revisions(real_sig, aero, mass)
-    if diag.get("n_bins", 0) == 0:
+    # ---- model update: the numeric, primary output ----
+    P("--- MODEL UPDATE (identifiability-aware, per-sample regression) ---")
+    P(f"  basis: quasi-steady cruise, lift = n*W (n=1/cos(roll), banked samples "
+      f"kept to {_FIT_ROLL_MAX:.0f} deg), mass={mass:.2f} kg (--mass overrides)")
+    if diag.get("n_fit", 0) == 0 and not revs:
         P("  (insufficient real cruise data to constrain any coefficient)")
     else:
+        P(f"  drag channel: {diag.get('drag_channel') or 'n/a'}")
         V = diag.get("V", (float("nan"),) * 2)
         CL = diag.get("CL", (float("nan"),) * 2)
         aoaspan = diag.get("aoa")
         aoa_str = (f"AoA {aoaspan[0]:.1f}-{aoaspan[1]:.1f} deg"
-                   if aoaspan else "no AoA")
-        P(f"  data span: {diag['n_bins']} airspeed bin(s), V {V[0]:.0f}-{V[1]:.0f} m/s, "
+                   if aoaspan else "no AoA sensor data")
+        P(f"  data span: {diag.get('n_fit', 0)} fit samples, V {V[0]:.0f}-{V[1]:.0f} m/s, "
           f"CL {CL[0]:.2f}-{CL[1]:.2f} (spread {diag.get('cl_spread', 0):.0%}), {aoa_str}")
+        if "soc" in diag:
+            P(f"  powertrain inversion at SoC {diag['soc']:.0%} (from measured pack voltage)")
 
         ident = [r for r in revs if r.kind == "identified"]
         combo = [r for r in revs if r.kind == "combination"]
         if ident:
             P("  data-driven (identified):")
-            for r in ident:
-                s = f" sigma~{r.sigma:.4f}" if np.isfinite(r.sigma) else ""
-                P(f"    <{r.tag}>  {r.old:+.6f} -> {r.new:+.6f}  (d {r.new - r.old:+.6f}{s})")
-                P(f"        {r.note}")
+        for r in ident:
+            s = f"  sigma~{r.sigma:.4f}" if np.isfinite(r.sigma) else ""
+            P(f"    <{r.tag}>  {r.old:+.6f} -> {r.new:+.6f}  "
+              f"(d {r.new - r.old:+.6f}{s})  [{r.channel}]")
+            P(f"        {r.note}")
         if combo:
-            P("  combination only (one operating point -- offset put on leading term):")
-            for r in combo:
-                P(f"    <{r.tag}>  {r.old:+.6f} -> {r.new:+.6f}  (d {r.new - r.old:+.6f})")
-                P(f"        {r.note}")
+            P("  combination only (offset put on leading term, partner held):")
+        for r in combo:
+            s = f"  sigma~{r.sigma:.4f}" if np.isfinite(r.sigma) else ""
+            P(f"    <{r.tag}>  {r.old:+.6f} -> {r.new:+.6f}  "
+              f"(d {r.new - r.old:+.6f}{s})  [{r.channel}]")
+            P(f"        {r.note}")
 
-        # Cross-check the drag-based CD0 move against the (more reliable) battery
-        # power gap: P_elec ~ T*V/eta, so at cruise the power ratio independently
-        # estimates the drag ratio. If power already agrees but the RPM-derived
-        # CD0 move is large, the CD0 figure is suspect (thrust-from-RPM is noisy).
-        cd0_rev = next((r for r in revs if r.tag == "CD0"), None)
-        if (cd0_rev and np.isfinite(pow_bias) and real_sig.power is not None
-                and np.isfinite(real_sig.power).any()):
-            p_real_mean = float(np.nanmean(real_sig.power))
-            rel_pow = pow_bias / p_real_mean if p_real_mean else float("nan")
-            rel_cd0 = (abs(cd0_rev.new - cd0_rev.old) / abs(cd0_rev.old)
-                       if cd0_rev.old else float("inf"))
-            if np.isfinite(rel_pow) and abs(rel_pow) < 0.15 and rel_cd0 > 0.3:
-                P(f"  CONFLICT: the CD0 move is {rel_cd0:.0%} but the battery-power gap is only "
-                  f"{rel_pow:+.0%}.")
-                P(f"        Power says drag is already ~right; the CD0 figure rests on "
-                  f"thrust-from-RPM ({real_sig.thrust_src}, noisy here).")
-                P("        Prefer the power evidence -- change CD0 little, if at all.")
+        # power-vs-RPM cross-check: same dCD estimated on both channels
+        dp = diag.get("dCD0_power", float("nan"))
+        dr = diag.get("dCD0_rpm", float("nan"))
+        if np.isfinite(dp) and np.isfinite(dr):
+            P(f"  cross-check: mean dCD {dp:+.4f} (battery power)  vs  "
+              f"{dr:+.4f} (thrust-from-RPM)")
+            if abs(dr - dp) <= max(0.25 * abs(dp), 0.005):
+                P("        channels agree -> the power-based numbers are corroborated.")
+            else:
+                P("        channels DISAGREE -> trust POWER (RPM-thrust: one ESC "
+                  "instance, spikes); the RPM figure is reference only.")
 
         # Held at the Flow5/VLM prior: coupled partners the span can't split, plus
         # everything steady cruise can't excite (rates ~ 0, fixed AoA, pre-stall).
@@ -1409,7 +1730,109 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
         for tag, why in held:
             P(f"    {tag:34s} {why}")
         P("  -> to unlock the held set, fly: airspeed sweep + AoA sweep + roll/pitch/yaw doublets.")
-        P("  apply identified/combination terms ONE at a time, re-run SITL, re-compare.")
+        P("  apply with --write-sdf, re-run SITL, re-compare; the ledger tracks the score.")
+    P("")
+
+    # ---- qualitative flags: gaps the cruise regression cannot fit ----
+    P("--- QUALITATIVE FLAGS (transition / trim -- outside the fit's scope) ---")
+    flags = []
+    if np.isfinite(pitch_bias) and abs(pitch_bias) > 1.0 and (
+            not np.isfinite(aoa_bias) or abs(pitch_bias - aoa_bias) > 1.0):
+        flags.append(
+            f"near-constant pitch offset ({pitch_bias:+.2f} deg) not explained by AoA: "
+            "zero-AoA pitching moment / CG -> adjust Cem0 (and CG vs <cp>).")
+    if tm.have:
+        if np.isfinite(tm.xcorr_peak) and tm.xcorr_peak < 0.6:
+            flags.append(
+                f"low pitch-rate xcorr ({tm.xcorr_peak:.2f}): transition pitch dynamics differ "
+                "-> check post-stall block (alpha_stall, CLa_stall, CDa_stall) and Cema.")
+        if np.isfinite(tm.rms_pitch) and tm.rms_pitch > 5.0:
+            flags.append(
+                f"high RMS pitch error ({tm.rms_pitch:.1f} deg) in transition "
+                "-> high-AoA longitudinal aero (Viterna post-stall: alpha_stall, CLa_stall, "
+                "CDa_stall) and pitch-damping suspect.")
+        if (np.isfinite(tm.t2v_real) and np.isfinite(tm.t2v_sitl)
+                and abs(tm.t2v_sitl - tm.t2v_real) > 1.0):
+            d = tm.t2v_sitl - tm.t2v_real
+            flags.append(
+                f"SITL reaches target airspeed {abs(d):.1f} s "
+                f"{'SLOWER' if d > 0 else 'FASTER'} than real: check overall drag level "
+                "(CD0 above), prop CSV and SDF mass vs real.")
+    if overshoot_flag is not None:
+        _, ratio = overshoot_flag
+        if ratio > 1.15:
+            flags.append(
+                f"SITL over-coasts the back transition (peak excursion x{ratio:.2f} vs real): "
+                "the aircraft pitches into deep stall to decelerate, so this is the post-stall "
+                "DRAG -> RAISE CDa_stall (and check alpha_stall earlier / CLa_stall) so SITL "
+                "sheds speed and stops at the hover point instead of overshooting in XY.")
+        elif ratio < 0.85:
+            flags.append(
+                f"SITL under-coasts the back transition (peak excursion x{ratio:.2f} vs real): "
+                "post-stall drag too high -> LOWER CDa_stall.")
+    if not flags:
+        flags.append("none -- transition/trim metrics within thresholds.")
+    for s in flags:
+        P(f"  * {s}")
+    P("")
+
+    # ---- assemble metrics + composite score ----
+    t2v_delta = (tm.t2v_sitl - tm.t2v_real
+                 if np.isfinite(tm.t2v_real) and np.isfinite(tm.t2v_sitl)
+                 else float("nan"))
+    trk = {}
+    for key in ("forward", "back"):
+        tt = tracks.get(key) if tracks else None
+        if tt is None or not tt.have:
+            trk[key] = {"have": False}
+        else:
+            trk[key] = {"have": True,
+                        "overshoot_real_m": tt.overshoot_real,
+                        "overshoot_sitl_m": tt.overshoot_sitl,
+                        "overshoot_ratio": tt.overshoot_ratio,
+                        "rms_horiz_m": tt.rms_horiz,
+                        "rms_pitch_deg": tt.rms_pitch,
+                        "lag_s": tt.lag_s, "xcorr_peak": tt.xcorr_peak}
+    metrics = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "real": real.path, "sitl": sitl.path, "mass_kg": mass,
+        "aero": {k: getattr(aero, k) for k in
+                 ("area", "AR", "eff", "CL0", "CLa", "CD0", "Cem0", "Cema",
+                  "alpha_stall", "CLa_stall", "CDa_stall")},
+        "cruise": {"thrust_bias_N": thrust_bias, "aoa_bias_deg": aoa_bias,
+                   "pitch_bias_deg": pitch_bias,
+                   "thrust_slope_ratio": thrust_slope_ratio},
+        "electrical": {"ref": elec_ref, "current_bias_A": cur_bias,
+                       "power_bias_W": pow_bias, "power_bias_rel": pow_bias_rel},
+        "hover": {"real_A": hover_real.current if hover_real else None,
+                  "real_W": hover_real.power if hover_real else None,
+                  "sitl_A": hover_sitl.current if hover_sitl else None,
+                  "sitl_W": hover_sitl.power if hover_sitl else None,
+                  "model_A": hover_pred[0] if hover_pred else None,
+                  "model_W": hover_pred[1] if hover_pred else None},
+        "transition": {"have": tm.have, "xcorr_peak": tm.xcorr_peak,
+                       "lag_s": tm.lag_s, "rms_pitch_deg": tm.rms_pitch,
+                       "target_v_ms": tm.target_v, "t2v_real_s": tm.t2v_real,
+                       "t2v_sitl_s": tm.t2v_sitl, "t2v_delta_s": t2v_delta},
+        "tracks": trk,
+        "fit": {"diag": {k: v for k, v in diag.items()
+                         if k != "power_thrust_curve"},
+                "revisions": [{"tag": r.tag, "old": r.old, "new": r.new,
+                               "kind": r.kind, "sigma": r.sigma,
+                               "channel": r.channel, "note": r.note}
+                              for r in revs]},
+    }
+    score, parts = composite_score(metrics)
+    metrics["score"] = score
+    metrics["score_parts"] = parts
+    P("--- FIDELITY SCORE (lower = SITL closer to real; same scales every run) ---")
+    if np.isfinite(score):
+        P(f"  score = {score:.3f}   "
+          f"({', '.join(f'{k}={p:.2f}' for k, p in sorted(parts.items()))})")
+        P("  channel scales: power 10% | cruise pitch 2 deg | transition pitch RMS")
+        P("  10 deg | time-to-airspeed 2 s | back overshoot x1.25 -> each = 1.0")
+    else:
+        P("  n/a (no comparable channel produced a finite gap)")
 
     report = "\n".join(lines)
     os.makedirs(outdir, exist_ok=True)
@@ -1417,6 +1840,218 @@ def write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, outdir,
         f.write(report + "\n")
     print("\n" + report)
     print(f"\n[written] {os.path.join(outdir, 'report.txt')}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable outputs: composite score, metrics.json, run ledger
+# ---------------------------------------------------------------------------
+def composite_score(metrics: dict):
+    """Single lower-is-better fidelity number: RMS of normalized channel gaps.
+
+    Each channel is divided by the gap that should count as "1.0 off":
+    power 10% of real draw, cruise pitch bias 2 deg, transition pitch RMS
+    10 deg, time-to-airspeed 2 s, back-transition overshoot ratio x1.25.
+    Only channels with finite data participate, so compare scores between runs
+    with the same channels available (the parts are recorded alongside).
+    """
+    parts = {}
+
+    def add(name, val, scale):
+        if val is not None and np.isfinite(val):
+            parts[name] = abs(val) / scale
+
+    add("power", metrics["electrical"].get("power_bias_rel"), 0.10)
+    add("cruise_pitch", metrics["cruise"].get("pitch_bias_deg"), 2.0)
+    add("trans_pitch_rms", metrics["transition"].get("rms_pitch_deg"), 10.0)
+    add("t2v", metrics["transition"].get("t2v_delta_s"), 2.0)
+    ratio = metrics["tracks"].get("back", {}).get("overshoot_ratio")
+    if ratio is not None and np.isfinite(ratio) and ratio > 0:
+        add("back_overshoot", math.log(ratio), math.log(1.25))
+    if not parts:
+        return float("nan"), parts
+    return float(np.sqrt(np.mean([p * p for p in parts.values()]))), parts
+
+
+def _json_sanitize(obj):
+    """numpy scalars/arrays -> python; non-finite floats -> None (JSON-safe)."""
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_json_sanitize(v) for v in obj.tolist()]
+    if isinstance(obj, (np.floating, float)):
+        f = float(obj)
+        return f if math.isfinite(f) else None
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+
+def save_metrics(metrics: dict, outdir: str) -> str:
+    path = os.path.join(outdir, "metrics.json")
+    with open(path, "w") as f:
+        json.dump(_json_sanitize(metrics), f, indent=2)
+    return path
+
+
+# Flat per-run history: one row per compare run, so successive SDF edits can be
+# judged by the score trend instead of re-reading reports.
+_LEDGER_COLS = [
+    "timestamp", "score", "real", "sitl", "sdf", "mass_kg",
+    "CD0", "CL0", "CLa", "eff", "alpha_stall", "CLa_stall", "CDa_stall",
+    "Cem0", "Cema",
+    "power_bias_W", "power_bias_rel", "thrust_bias_N", "aoa_bias_deg",
+    "pitch_bias_deg", "trans_xcorr", "trans_rms_pitch_deg", "t2v_delta_s",
+    "overshoot_ratio_fwd", "overshoot_ratio_back",
+    "fit_CD0", "fit_eff", "fit_CL0", "fit_CLa",
+]
+
+
+def append_ledger(path: str, metrics: dict, sdf_path: str) -> None:
+    fit = {r["tag"]: r["new"] for r in metrics["fit"]["revisions"]}
+    row = {
+        "timestamp": metrics["timestamp"], "score": metrics.get("score"),
+        "real": metrics["real"], "sitl": metrics["sitl"], "sdf": sdf_path,
+        "mass_kg": metrics["mass_kg"],
+        **{k: metrics["aero"].get(k) for k in
+           ("CD0", "CL0", "CLa", "eff", "alpha_stall", "CLa_stall",
+            "CDa_stall", "Cem0", "Cema")},
+        "power_bias_W": metrics["electrical"].get("power_bias_W"),
+        "power_bias_rel": metrics["electrical"].get("power_bias_rel"),
+        "thrust_bias_N": metrics["cruise"].get("thrust_bias_N"),
+        "aoa_bias_deg": metrics["cruise"].get("aoa_bias_deg"),
+        "pitch_bias_deg": metrics["cruise"].get("pitch_bias_deg"),
+        "trans_xcorr": metrics["transition"].get("xcorr_peak"),
+        "trans_rms_pitch_deg": metrics["transition"].get("rms_pitch_deg"),
+        "t2v_delta_s": metrics["transition"].get("t2v_delta_s"),
+        "overshoot_ratio_fwd": metrics["tracks"].get("forward", {}).get("overshoot_ratio"),
+        "overshoot_ratio_back": metrics["tracks"].get("back", {}).get("overshoot_ratio"),
+        "fit_CD0": fit.get("CD0"), "fit_eff": fit.get("eff"),
+        "fit_CL0": fit.get("CL0"), "fit_CLa": fit.get("CLa"),
+    }
+    row = {k: ("" if v is None or (isinstance(v, float) and not math.isfinite(v))
+               else v) for k, v in _json_sanitize(row).items()}
+    new = not os.path.exists(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_LEDGER_COLS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+    print(f"[ledger ] appended to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Apply revisions back into the SDF (--write-sdf)
+# ---------------------------------------------------------------------------
+def write_revised_sdf(sdf_path: str, revs: list, out_path: str,
+                      source_note: str) -> list[str]:
+    """Copy the SDF with identified/combination revisions applied to the
+    AdvancedLiftDrag block, plus a provenance comment. Pure text substitution
+    so formatting and comments survive. Returns the changed-tag summaries.
+    """
+    with open(sdf_path) as f:
+        text = f.read()
+    m = re.search(r"<plugin[^>]*advanced[-_]?lift[-_]?drag[^>]*>.*?</plugin>",
+                  text, re.S | re.I)
+    if not m:
+        print(f"[sdf    ] no AdvancedLiftDrag plugin block in {sdf_path} -> skipped")
+        return []
+    block = m.group(0)
+    new_block = block
+    changed = []
+    for r in revs:
+        if r.kind == "held" or not np.isfinite(r.new):
+            continue
+        # tags are case-sensitive on purpose: <CL0> is lift, <Cl0> roll moment
+        pat = re.compile(r"(<{0}>)\s*[-+0-9.eE]+\s*(</{0}>)".format(re.escape(r.tag)))
+        if not pat.search(new_block):
+            print(f"[sdf    ] tag <{r.tag}> not found in plugin block -> skipped")
+            continue
+        new_block = pat.sub(
+            lambda mm: f"{mm.group(1)}{r.new: .6f}{mm.group(2)}", new_block, count=1)
+        changed.append(f"{r.tag} {r.old:.6f}->{r.new:.6f} ({r.kind}, {r.channel})")
+    if not changed:
+        print("[sdf    ] no applicable revisions -> no SDF written")
+        return []
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    comment = ("<!-- compare_logs.py model update {0}\n"
+               "         {1}\n"
+               "         from {2} -->\n    ".format(
+                   stamp, "\n         ".join(changed), source_note))
+    text = text[:m.start()] + comment + new_block + text[m.end():]
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write(text)
+    print(f"[sdf    ] wrote revised SDF -> {out_path}")
+    for c in changed:
+        print(f"          {c}")
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Input resolution: --sitl latest, config-file defaults
+# ---------------------------------------------------------------------------
+def resolve_latest_sitl(spec: str, logs_dir: str) -> str:
+    """'latest' or 'latest-N' -> the (N-back) newest .BIN in the SITL log dir.
+
+    Prefers LASTLOG.TXT (ArduPilot writes the current log number there);
+    falls back to the newest *.BIN by mtime.
+    """
+    m = re.fullmatch(r"latest(?:-(\d+))?", spec)
+    if not m:
+        return spec
+    back = int(m.group(1) or 0)
+    d = os.path.expanduser(logs_dir)
+    lastlog = os.path.join(d, "LASTLOG.TXT")
+    if os.path.exists(lastlog):
+        try:
+            num = int(open(lastlog).read().strip()) - back
+            cand = os.path.join(d, f"{num:08d}.BIN")
+            if os.path.exists(cand):
+                return cand
+        except ValueError:
+            pass
+    bins = sorted((p for p in os.listdir(d) if p.upper().endswith(".BIN")
+                   and p[:8].isdigit()),
+                  key=lambda p: os.path.getmtime(os.path.join(d, p)))
+    if len(bins) <= back:
+        raise SystemExit(f"--sitl {spec}: no matching .BIN under {d}")
+    return os.path.join(d, bins[-1 - back])
+
+
+# config/compare.ini supplies defaults for these (CLI always wins); numeric
+# keys are cast. sitl_logs_dir steers 'latest' resolution.
+_CFG_STR = ("real", "sitl", "sdf", "prop", "motor", "battery", "outdir",
+            "ledger", "sitl_logs_dir")
+_CFG_NUM = ("motors", "mass", "vmin", "vmax", "vstep", "max_climb", "max_roll",
+            "max_accel")
+
+
+def load_compare_config(path: str | None) -> dict:
+    if path is None:
+        path = find_config("compare.ini")
+    if not path or not os.path.exists(path):
+        return {}
+    cp = configparser.ConfigParser()
+    cp.read(path)
+    if "compare" not in cp:
+        return {}
+    out = {}
+    for k, v in cp["compare"].items():
+        if k in _CFG_NUM:
+            out[k] = int(v) if k == "motors" else float(v)
+        elif k in _CFG_STR:
+            out[k] = v
+        else:
+            print(f"[config ] ignoring unknown key '{k}' in {path}")
+    if out:
+        print(f"[config ] defaults from {path}: {', '.join(sorted(out))}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1435,26 +2070,49 @@ def main() -> None:
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--real", required=True,
+    ap.add_argument("--real", default=None,
                     help="REAL flight: a chop_log CSV dir OR a .bin log (auto-chopped)")
-    ap.add_argument("--sitl", required=True,
-                    help="SITL run: a chop_log CSV dir OR a .bin log (auto-chopped)")
-    ap.add_argument("--sdf", required=True, help="SDF model file (VITERNA aero)")
-    ap.add_argument("--prop", required=True, help="propeller CSV (rpm,v_ms,thrust_N,torque_Nm)")
+    ap.add_argument("--sitl", default=None,
+                    help="SITL run: CSV dir, .bin log, or 'latest'/'latest-N' "
+                         "(newest SITL log via LASTLOG.TXT)")
+    ap.add_argument("--sdf", default=None, help="SDF model file (VITERNA aero)")
+    ap.add_argument("--prop", default=None,
+                    help="propeller CSV (rpm,v_ms,thrust_N,torque_Nm)")
     ap.add_argument("--motor", default=None,
                     help="motor XML for the current/power prediction (default: ./motor.xml)")
     ap.add_argument("--battery", default=None,
                     help="battery XML for the current/power prediction (default: ./battery.xml)")
     ap.add_argument("--motors", type=int, default=None,
                     help="rotor count for the power prediction (default: SDF n_motors)")
-    ap.add_argument("--outdir", default="plots/compare", help="output directory")
-    ap.add_argument("--vmin", type=float, default=8.0, help="min cruise airspeed (m/s)")
-    ap.add_argument("--vmax", type=float, default=60.0, help="max airspeed for bins/predict")
-    ap.add_argument("--vstep", type=float, default=2.0, help="airspeed bin width (m/s)")
-    ap.add_argument("--max-climb", type=float, default=1.5,
-                    help="|climb rate| ceiling for level-cruise samples (m/s)")
+    ap.add_argument("--outdir", default=None,
+                    help="output directory (default plots/compare)")
+    ap.add_argument("--vmin", type=float, default=None,
+                    help="min cruise airspeed (m/s, default 8)")
+    ap.add_argument("--vmax", type=float, default=None,
+                    help="max airspeed for bins/predict (default 60)")
+    ap.add_argument("--vstep", type=float, default=None,
+                    help="airspeed bin width (m/s, default 2)")
+    ap.add_argument("--max-climb", type=float, default=None,
+                    help="|climb rate| ceiling for level-cruise samples (m/s, default 1.5)")
+    ap.add_argument("--max-roll", type=float, default=None,
+                    help="|roll| ceiling for the binned (wings-level) signature "
+                         "(deg, default 10); the regression keeps banked samples "
+                         "to 45 deg with load-factor-corrected CL")
+    ap.add_argument("--max-accel", type=float, default=None,
+                    help="|dV/dt| ceiling for quasi-steady cruise samples "
+                         "(m/s^2, default 0.5)")
     ap.add_argument("--mass", type=float, default=None,
                     help="real aircraft mass (kg) for level-cruise CL; default = SDF mass")
+    ap.add_argument("--config", default=None,
+                    help="defaults INI (default: config/compare.ini, [compare] section)")
+    ap.add_argument("--write-sdf", nargs="?", const="auto", default=None,
+                    metavar="PATH",
+                    help="write a copy of the SDF with the fitted revisions applied "
+                         "(default PATH: <outdir>/<sdf-stem>-revised.sdf)")
+    ap.add_argument("--ledger", default=None,
+                    help="run-ledger CSV (default: <outdir>/../compare_runs.csv)")
+    ap.add_argument("--no-ledger", action="store_true",
+                    help="do not append this run to the ledger CSV")
     ap.add_argument("--chop-tier", type=int, choices=[1, 2, 3], default=3,
                     help="tier for auto-chopping a .bin input (default 3 = full data)")
     ap.add_argument("--chop-hz", type=float, default=50.0,
@@ -1472,11 +2130,34 @@ def main() -> None:
     ap.add_argument("--no-show", action="store_true", help="save plots without displaying")
     args = ap.parse_args()
 
+    # config-file defaults fill anything the CLI left unset; CLI always wins
+    cfg = load_compare_config(args.config)
+    for k in _CFG_STR + _CFG_NUM:
+        if k != "sitl_logs_dir" and getattr(args, k, None) is None and k in cfg:
+            setattr(args, k, cfg[k])
+    args.outdir = args.outdir or "plots/compare"
+    args.vmin = 8.0 if args.vmin is None else args.vmin
+    args.vmax = 60.0 if args.vmax is None else args.vmax
+    args.vstep = 2.0 if args.vstep is None else args.vstep
+    args.max_climb = 1.5 if args.max_climb is None else args.max_climb
+    args.max_roll = 10.0 if args.max_roll is None else args.max_roll
+    args.max_accel = 0.5 if args.max_accel is None else args.max_accel
+    missing = [k for k in ("real", "sitl", "sdf", "prop") if not getattr(args, k)]
+    if missing:
+        ap.error("missing " + ", ".join("--" + m for m in missing)
+                 + " (give them on the CLI or in config/compare.ini)")
+    sitl_spec = args.sitl
+    args.sitl = resolve_latest_sitl(args.sitl,
+                                    cfg.get("sitl_logs_dir", "~/ardupilot/logs"))
+    if args.sitl != sitl_spec:
+        print(f"[sitl   ] '{sitl_spec}' -> {args.sitl}")
+
     if args.no_show:
         import matplotlib
         matplotlib.use("Agg")
 
-    aero, sdf_mass, propulsion, info = load_sdf_model(find_config(args.sdf, "aero"))
+    sdf_path = find_config(args.sdf, "aero")
+    aero, sdf_mass, propulsion, info = load_sdf_model(sdf_path)
     mass = args.mass if args.mass else sdf_mass
     sdf_prop_info = {"max_rad_per_s": propulsion.max_rad_per_s or 2100.0,
                      "n_motors": propulsion.n_motors or 4}
@@ -1496,9 +2177,15 @@ def main() -> None:
 
     print("computing cruise signatures...")
     real_sig = cruise_signature(real, prop, sdf_prop_info, args.vmin, args.vmax,
-                                args.vstep, args.max_climb)
+                                args.vstep, args.max_climb, args.max_roll,
+                                args.max_accel)
     sitl_sig = cruise_signature(sitl, prop, sdf_prop_info, args.vmin, args.vmax,
-                                args.vstep, args.max_climb)
+                                args.vstep, args.max_climb, args.max_roll,
+                                args.max_accel)
+
+    print("computing hover signatures...")
+    hover_real = hover_signature(real, args.max_climb)
+    hover_sitl = hover_signature(sitl, args.max_climb)
 
     print("computing transition dynamics...")
     tm = transition_metrics(real, sitl, args.pre, args.post, args.dt)
@@ -1519,24 +2206,51 @@ def main() -> None:
     battery_xml = find_config(args.battery or "battery.xml", "batteries")
     battery_xml = battery_xml if os.path.exists(battery_xml) else None
     n_mot = args.motors or sdf_prop_info["n_motors"]
-    elec_pred = None
+    elec_pred = hover_pred = powertrain = None
     if motor_xml and battery_xml:
         try:
             Vpred = np.linspace(2.0, args.vmax, 80)
             elec_pred = predicted_elec(aero, mass, find_config(args.prop, "propellers"),
                                        motor_xml, battery_xml, n_mot, Vpred)
+            hover_pred = predicted_hover(find_config(args.prop, "propellers"),
+                                         motor_xml, battery_xml, n_mot, mass)
+            powertrain = {"motor": load_motor(motor_xml),
+                          "prop": load_propeller_csv(find_config(args.prop, "propellers")),
+                          "battery": load_battery(battery_xml),
+                          "n_motors": n_mot}
             print(f"powertrain model: {os.path.basename(motor_xml)} + "
                   f"{os.path.basename(battery_xml)}, {n_mot} motors")
         except Exception as e:
             print(f"powertrain prediction skipped: {e}")
     else:
-        print("no motor/battery XML -> current/power prediction skipped")
+        print("no motor/battery XML -> current/power prediction + power fit skipped")
+
+    print("fitting model update (power-primary regression)...")
+    revs, diag = recommend_revisions(real_sig, aero, mass, powertrain,
+                                     v_step=args.vstep)
 
     make_plots(real_sig, sitl_sig, aero, mass, real, sitl, tm,
-               args.outdir, not args.no_show, args.pre, args.post, args.dt, elec_pred)
+               args.outdir, not args.no_show, args.pre, args.post, args.dt, elec_pred,
+               hover_real=hover_real, hover_sitl=hover_sitl, hover_pred=hover_pred,
+               pow_curve=diag.get("power_thrust_curve"))
     make_track_plots(tracks, args.outdir, not args.no_show, args.track_pre)
-    write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass, args.outdir,
-                 elec_pred, tracks)
+    metrics = write_report(real_sig, sitl_sig, tm, real, sitl, aero, mass,
+                           args.outdir, elec_pred, tracks,
+                           hover_real=hover_real, hover_sitl=hover_sitl,
+                           hover_pred=hover_pred, revs=revs, diag=diag)
+
+    print(f"[metrics] {save_metrics(metrics, args.outdir)}")
+    if not args.no_ledger:
+        ledger = args.ledger or os.path.join(
+            os.path.dirname(os.path.abspath(args.outdir)), "compare_runs.csv")
+        append_ledger(ledger, metrics, sdf_path)
+    if args.write_sdf:
+        out_sdf = args.write_sdf
+        if out_sdf == "auto":
+            stem = os.path.splitext(os.path.basename(sdf_path))[0]
+            out_sdf = os.path.join(args.outdir, stem + "-revised.sdf")
+        write_revised_sdf(sdf_path, revs, out_sdf,
+                          f"real={args.real} sitl={args.sitl}")
 
 
 if __name__ == "__main__":

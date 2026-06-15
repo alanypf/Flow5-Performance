@@ -1,0 +1,67 @@
+{
+  "fileType": "MavlinkActions",
+  "version": 1,
+  "actions": [
+    {
+      "label": "释放降落伞",
+      "description": "向ArduPilot发送开伞指令（MAV_CMD_DO_PARACHUTE #208，param1=2）",
+      "mavCmd": 208,
+      "param1": 2,
+      "param2": 0,
+      "param3": 0,
+      "param4": 0,
+      "param5": 0,
+      "param6": 0,
+      "param7": 0,
+      "componentId": 1
+    },
+    {
+      "label": "Plane Arm",
+      "description": "解锁飞机",
+      "mavCmd": 400,
+      "param1": 1.0,
+      "param2": 21196.0,
+      "param3": 0.0,
+      "param4": 0.0,
+      "param5": 0.0,
+      "param6": 0.0,
+      "param7": 0.0
+    },
+    {
+      "label": "Plane Disarm",
+      "description": "上锁飞机",
+      "mavCmd": 400,
+      "param1": 0.0,
+      "param2": 21196.0,
+      "param3": 0.0,
+      "param4": 0.0,
+      "param5": 0.0,
+      "param6": 0.0,
+      "param7": 0.0
+    },
+    {
+      "label": "Mode Terminal",
+      "description": "ArduPilot自定义飞行模式66",
+      "mavCmd": 176,
+      "param1": 1.0,
+      "param2": 66.0,
+      "param3": 0.0,
+      "param4": 0.0,
+      "param5": 0.0,
+      "param6": 0.0,
+      "param7": 0.0
+    },
+    {
+      "label": "Cruise 55 m/s",
+      "description": "设置巡航空速55m/s（MAV_CMD_DO_CHANGE_SPEED #178，param1=0 空速，param2=55，param3=-1 油门不变）",
+      "mavCmd": 178,
+      "param1": 0.0,
+      "param2": 55.0,
+      "param3": -1.0,
+      "param4": 0.0,
+      "param5": 0.0,
+      "param6": 0.0,
+      "param7": 0.0
+    }
+  ]
+}

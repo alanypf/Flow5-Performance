@@ -49,7 +49,8 @@ Usage:
         --motors 4 --vmin 40 --vmax 90 --vstep 5 \
         --save plots/sdf_perf.png \
         --save-aero plots/sdf_aero.png \
-        --save-compare plots/sdf_compare.png --no-show
+        --save-compare plots/sdf_compare.png \
+        --save-current plots/sdf_current.png --no-show
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from config_paths import find_config
+from hover_performance import HoverPoint, solve_hover
 from motor_prop_performance import (
     Battery,
     Motor,
@@ -871,6 +873,62 @@ def plot_cruise(aero: AeroModel, mass: float, pts: list[CruisePoint],
         plt.close(fig)
 
 
+def plot_current(hover: HoverPoint | None, pts: list[CruisePoint],
+                 summary: CruiseSummary, motor: Motor, battery: Battery,
+                 n_motors: int, save_path: str | None, show: bool) -> None:
+    """Pack / per-motor current draw vs airspeed, with hover at V = 0."""
+    import matplotlib.pyplot as plt
+
+    V = np.array([p.V for p in pts])
+    I_per = np.array([p.current_per_motor_A for p in pts])
+    I_pack = I_per * n_motors
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(V, I_pack, color="C0", label=f"Pack current (cruise, {n_motors} motors)")
+    ax.plot(V, I_per, color="C1", ls="--", label="Per-motor current (cruise)")
+
+    if hover is not None:
+        I_hover_pack = hover.current_per_motor_A * n_motors
+        ax.plot(0.0, I_hover_pack, "o", color="C3", ms=8, zorder=5)
+        ax.plot(0.0, hover.current_per_motor_A, "o", color="C3", ms=6,
+                mfc="none", zorder=5)
+        ax.annotate(f"hover: {I_hover_pack:.1f} A pack\n"
+                    f"({hover.current_per_motor_A:.1f} A/motor, "
+                    f"thr {hover.throttle * 100:.0f}%)",
+                    xy=(0.0, I_hover_pack), xytext=(8, 8),
+                    textcoords="offset points", fontsize=8, color="C3")
+
+    # Current-limit lines -- only when close enough to the data to be
+    # readable (a 500+ A C-limit would squash the cruise curves otherwise).
+    finite = I_pack[np.isfinite(I_pack)]
+    I_data_max = float(finite.max()) if finite.size else 0.0
+    if hover is not None:
+        I_data_max = max(I_data_max, hover.current_per_motor_A * n_motors)
+    if (battery.I_max is not None and math.isfinite(battery.I_max)
+            and battery.I_max < 2.0 * I_data_max):
+        ax.axhline(battery.I_max, color="r", ls=":", lw=0.8,
+                   label=f"battery limit {battery.I_max:.0f} A")
+    if (motor.Imax is not None and math.isfinite(motor.Imax)
+            and motor.Imax < 2.0 * I_data_max):
+        ax.axhline(motor.Imax, color="C1", ls=":", lw=0.8,
+                   label=f"motor Imax {motor.Imax:.0f} A (per motor)")
+
+    _annotate_v(ax, summary.V_min_power, "V_Pmin", "m")
+    ax.set_xlim(left=-2.0)
+    ax.set_xlabel("V [m/s]"); ax.set_ylabel("Current [A]")
+    ax.set_title("Current draw: hover (V=0) and cruise sweep")
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def plot_comparison(aero: AeroModel, mass: float,
                     gz_pts: list[GazeboCruisePoint],
                     pw_pts: list[CruisePoint],
@@ -989,7 +1047,8 @@ def _print_summary(aero: AeroModel, mass: float, motor: Motor,
                    battery: Battery, n_motors: int,
                    propulsion: SdfPropulsion,
                    summary: CruiseSummary, pts: list[CruisePoint],
-                   gz_pts: list[GazeboCruisePoint]) -> None:
+                   gz_pts: list[GazeboCruisePoint],
+                   hover: HoverPoint | None) -> None:
     print()
     print("=== Inputs ===")
     print(f"  SDF aero: area={aero.area:.4f} m^2  AR={aero.AR:.3f}  mac={aero.mac:.4f} m")
@@ -1005,6 +1064,28 @@ def _print_summary(aero: AeroModel, mass: float, motor: Motor,
     print(f"                       battery {battery.series}S{battery.parallel}P "
           f"{battery.chemistry}, V_pack(nom)={battery.V_nominal:.2f} V, "
           f"capacity={battery.capacity_Ah:.2f} Ah")
+
+    print()
+    print("=== Hover (provided powertrain, V = 0) ===")
+    if hover is None:
+        op_full = solve_operating_point(motor, prop_provided, battery, 1.0, 0.0)
+        T_full = (op_full.thrust_N * n_motors) if op_full else 0.0
+        print(f"  INFEASIBLE - full-throttle static thrust {T_full:.2f} N")
+    else:
+        I_pack = hover.current_per_motor_A * n_motors
+        print(f"  Throttle             : {hover.throttle * 100:6.1f} %")
+        print(f"  RPM                  : {hover.rpm:6.0f}")
+        print(f"  Current per motor    : {hover.current_per_motor_A:6.2f} A")
+        print(f"  Pack current         : {I_pack:6.2f} A")
+        print(f"  Electrical power     : {hover.P_elec_total_W:6.0f} W")
+        print(f"  Hover endurance      : {hover.endurance_min:6.1f} min")
+        print(f"  Thrust/Weight (max)  : {hover.thrust_to_weight_max:6.2f}")
+        if motor.Imax is not None and hover.current_per_motor_A > motor.Imax:
+            print(f"  WARNING: hover current {hover.current_per_motor_A:.1f} A "
+                  f"> motor Imax {motor.Imax:.1f} A")
+        if battery.I_max is not None and I_pack > battery.I_max:
+            print(f"  WARNING: pack current {I_pack:.0f} A > "
+                  f"battery limit {battery.I_max:.0f} A")
 
     print()
     print("=== Cruise summary (provided powertrain) ===")
@@ -1084,6 +1165,8 @@ def main() -> None:
                    help="Save the aero-model figure (CL/CD/Cm vs alpha) here")
     p.add_argument("--save-compare", default=None,
                    help="Save the Gazebo-vs-provided comparison figure here")
+    p.add_argument("--save-current", default=None,
+                   help="Save the hover + cruise current-draw figure here")
     p.add_argument("--gazebo-prop", default=None,
                    help="Override propeller CSV used by the SDF "
                         "(default: resolve <performance_file> from the SDF)")
@@ -1127,8 +1210,13 @@ def main() -> None:
                        usable_fraction=args.usable_fraction)
     summary = cruise_summary(aero, mass, pts)
 
+    # Hover (V = 0) trim with the same powertrain -- current draw at L = W.
+    hover = solve_hover(motor, prop_provided, battery, mass,
+                        n_motors=args.motors, soc=args.soc,
+                        usable_fraction=args.usable_fraction)
+
     _print_summary(aero, mass, motor, prop_provided, prop_gazebo, battery,
-                   args.motors, propulsion, summary, pts, gz_pts)
+                   args.motors, propulsion, summary, pts, gz_pts, hover)
 
     show = not args.no_show
     if args.save_aero or show:
@@ -1139,6 +1227,8 @@ def main() -> None:
     plot_comparison(aero, mass, gz_pts, pts, summary, motor, prop_provided,
                     prop_gazebo, battery, n_motors=args.motors,
                     rpm_max=rpm_max, save_path=args.save_compare, show=show)
+    plot_current(hover, pts, summary, motor, battery, n_motors=args.motors,
+                 save_path=args.save_current, show=show)
 
 
 if __name__ == "__main__":

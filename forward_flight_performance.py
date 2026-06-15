@@ -286,6 +286,7 @@ class ClimbPoint:
     drag_N: float
     excess_thrust_N: float
     roc_ms: float
+    gamma_max_deg: float   # max steady flight-path (climb) angle at this V
     TW_max: float          # full-throttle thrust / weight at this V
     TW_cruise: float       # drag / weight (trim thrust fraction) at this V
     rpm_max: float         # full-throttle (= max) prop rpm at this V
@@ -315,13 +316,19 @@ def climb_sweep(polar: dict, plane: dict, motor: Motor, prop: Propeller,
             continue
         T_total = op.thrust_N * n_motors
         excess = T_total - float(D)
-        roc = V * excess / W  # steady climb, small angle: RoC = V(T-D)/W
+        roc = V * excess / W  # steady climb: RoC = V*sin(gamma) = V*(T-D)/W
+        # Max steady flight-path angle: sin(gamma) = (T_max - D)/W. Uses the
+        # level-flight drag (L = W) approximation, consistent with the rest of
+        # this sweep; clipped to the physical [-90, 90] deg range.
+        sin_gamma = float(np.clip(excess / W, -1.0, 1.0))
+        gamma_max = float(np.degrees(np.arcsin(sin_gamma)))
         out.append(ClimbPoint(
             V=V,
             T_max_total_N=T_total,
             drag_N=float(D),
             excess_thrust_N=excess,
             roc_ms=roc,
+            gamma_max_deg=gamma_max,
             TW_max=T_total / W,
             TW_cruise=float(D) / W,
             rpm_max=op.rpm,
@@ -600,6 +607,17 @@ def print_forward_section(plane: dict, polar: dict, motor: Motor, prop: Propelle
         best = valid_climb[i]
         print(f"  Max RoC : {best.roc_ms:.2f} m/s  @ V = {best.V:.1f} m/s  "
               f"(excess thrust {best.excess_thrust_N:.2f} N)")
+        j = int(np.argmax([c.gamma_max_deg for c in valid_climb]))
+        steep = valid_climb[j]
+        print(f"  Max gamma : {steep.gamma_max_deg:.1f} deg  @ V = {steep.V:.1f} m/s  "
+              f"(steepest steady climb, sin g = (T_max - D)/W)")
+        print()
+        print("    V     RoC     gamma_max   T/W_max")
+        print("   m/s    m/s       deg")
+        print("  " + "-" * 38)
+        for c in valid_climb:
+            print(f"  {c.V:5.1f}  {c.roc_ms:5.2f}    {c.gamma_max_deg:6.1f}     "
+                  f"{c.TW_max:5.2f}")
     else:
         print("  No feasible climb points.")
 
@@ -911,6 +929,7 @@ def plot_forward_performance(plane: dict, polar: dict, motor: Motor, prop: Prope
     V_k = np.array([c.V for c in valid_k]) if valid_k else np.array([])
     T_max = np.array([c.T_max_total_N for c in valid_k]) if valid_k else np.array([])
     roc = np.array([c.roc_ms for c in valid_k]) if valid_k else np.array([])
+    gamma = np.array([c.gamma_max_deg for c in valid_k]) if valid_k else np.array([])
     TW_max = np.array([c.TW_max for c in valid_k]) if valid_k else np.array([])
     TW_trim = np.array([c.TW_cruise for c in valid_k]) if valid_k else np.array([])
 
@@ -1105,30 +1124,53 @@ def plot_forward_performance(plane: dict, polar: dict, motor: Motor, prop: Prope
     ai.set_title("Angle of attack (L = W)"); ai.grid(True, alpha=0.3)
     _save_individual(fi, os.path.join(ind, "06_angle_of_attack.png")); n_ind += 1
 
-    # 7) Rate of climb
+    # 7) Rate of climb + max flight-path angle
     ax = axes[1, 2]
     if V_k.size:
-        ax.plot(V_k, roc, "o-", color="tab:cyan")
+        ax.plot(V_k, roc, "o-", color="tab:cyan", label="RoC [m/s]")
         i_roc = int(np.argmax(roc))
         ax.plot(V_k[i_roc], roc[i_roc], "*", ms=14, color="tab:orange",
                 label=f"max RoC = {roc[i_roc]:.2f} m/s @ {V_k[i_roc]:.1f} m/s")
-        ax.legend(fontsize=8)
+        axg = ax.twinx()
+        axg.plot(V_k, gamma, "^--", color="tab:purple", ms=4,
+                 label="gamma_max [deg]")
+        i_g = int(np.argmax(gamma))
+        axg.plot(V_k[i_g], gamma[i_g], "*", ms=12, color="tab:purple",
+                 zorder=5)
+        axg.set_ylabel("Max flight-path angle [deg]", color="tab:purple")
+        axg.tick_params(axis="y", labelcolor="tab:purple")
+        ax.legend(fontsize=8, loc="upper right")
     ax.axhline(0, color="k", lw=0.8)
     ax.set_xlabel("Airspeed [m/s]")
-    ax.set_ylabel("Rate of climb [m/s]")
-    ax.set_title("Climb (full throttle)")
+    ax.set_ylabel("Rate of climb [m/s]", color="tab:cyan")
+    ax.tick_params(axis="y", labelcolor="tab:cyan")
+    ax.set_title("Climb (full throttle): RoC & max gamma")
     ax.grid(True, alpha=0.3)
 
     if V_k.size:
         fi, ai = plt.subplots(figsize=(7, 5))
-        ai.plot(V_k, roc, "o-", color="tab:cyan")
+        ai.plot(V_k, roc, "o-", color="tab:cyan", label="RoC [m/s]")
         i_roc = int(np.argmax(roc))
         ai.plot(V_k[i_roc], roc[i_roc], "*", ms=14, color="tab:orange",
                 label=f"max RoC = {roc[i_roc]:.2f} m/s @ {V_k[i_roc]:.1f} m/s")
         ai.axhline(0, color="k", lw=0.8)
-        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Rate of climb [m/s]")
-        ai.set_title("Climb (full throttle)"); ai.grid(True, alpha=0.3)
-        ai.legend(fontsize=9)
+        ai.set_xlabel("Airspeed [m/s]"); ai.set_ylabel("Rate of climb [m/s]",
+                                                       color="tab:cyan")
+        ai.tick_params(axis="y", labelcolor="tab:cyan")
+        aig = ai.twinx()
+        aig.plot(V_k, gamma, "^--", color="tab:purple", ms=4,
+                 label="gamma_max [deg]")
+        i_g = int(np.argmax(gamma))
+        aig.plot(V_k[i_g], gamma[i_g], "*", ms=14, color="tab:purple",
+                 zorder=5, label=f"max gamma = {gamma[i_g]:.1f} deg @ "
+                 f"{V_k[i_g]:.1f} m/s")
+        aig.set_ylabel("Max flight-path angle [deg]", color="tab:purple")
+        aig.tick_params(axis="y", labelcolor="tab:purple")
+        ai.set_title("Climb (full throttle): RoC & max gamma")
+        ai.grid(True, alpha=0.3)
+        lines1, lab1 = ai.get_legend_handles_labels()
+        lines2, lab2 = aig.get_legend_handles_labels()
+        ai.legend(lines1 + lines2, lab1 + lab2, fontsize=8)
         _save_individual(fi, os.path.join(ind, "07_rate_of_climb.png")); n_ind += 1
 
     # 8) Thrust vs Drag -> V_max

@@ -6,11 +6,11 @@
 
     <link name="base_link">
       <pose degrees="true">0 0 0 0 0 0</pose>
-      <!-- \todo provide proper inertial : actual mass 4.0 kg -->
+      <!-- \todo provide proper inertial : actual mass 3.8 kg, need to reduce the motors (0.1kg) and IMU mass(0.15kg) -->
       <!-- Post-stall aero coefficients replaced with Viterna-Corrigan model -->
       <inertial>
         <pose>0 0 0 0 0 0</pose>
-        <mass>4.0</mass>
+        <mass>3.55</mass>
         <inertia>
           <ixx>0.049</ixx>
           <ixy>0</ixy>
@@ -407,12 +407,12 @@
 
       <a0> 0.001840</a0>
       <CL0>-0.007595</CL0>
-      <CD0> 0.025286</CD0>
+      <CD0> 0.065</CD0>
       <Cem0>-0.003779</Cem0>
       <CLa> 4.126931</CLa>
       <CDa> 0.000000</CDa>
       <Cema>-0.297268</Cema>
-      <eff>1.0000</eff>
+      <eff>0.9</eff>
 
       <alpha_stall> 0.209440</alpha_stall>
       <CLa_stall>-0.629333</CLa_stall>

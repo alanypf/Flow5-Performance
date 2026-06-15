@@ -36,4 +36,24 @@ python motor_prop_performance.py PER3_8x10E.txt motor.xml battery.xml --vmin 0 -
 
 # 比较模型与飞行日志
 
+Defaults (real log dir, SITL `latest`, SDF, prop, motor/battery) live in
+`config/compare.ini`, so the routine run is:
+
+```bash
+python compare_logs.py --no-show                  # real vs newest SITL log
+python compare_logs.py --sitl latest-1 --no-show  # ... vs previous SITL log
+python compare_logs.py --no-show --write-sdf      # also emit the revised SDF
+```
+
+Outputs in `plots/compare/`: plots, `report.txt`, `metrics.json`; each run also
+appends a row (fidelity score + coefficient values) to `plots/compare_runs.csv`
+so you can tell whether the last SDF change improved the match. The MODEL
+UPDATE coefficients are fitted on battery power (thrust-from-RPM is only a
+cross-check); `--write-sdf` writes `<outdir>/<sdf-stem>-revised.sdf` with the
+fitted values applied — copy/diff it into the live model SDF by hand.
+
+Everything is still overridable explicitly:
+
+```bash
 python compare_logs.py   --real ../Ardu_Log/out   --sitl ~/ardupilot/logs/00000107.BIN   --sdf  ../ardupilot_gazebo/models/waterdrop/model-aero-VITERNA-m.sdf   --prop ../ardupilot_gazebo/models/waterdrop/propellers/PER3_7x11E.csv   --outdir plots/compare --no-show
+```
